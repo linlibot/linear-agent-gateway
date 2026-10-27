@@ -1,0 +1,9 @@
+.local-runtime/
+.env
+.env.*
+!.env.example
+.private/
+*.har
+*.log
+node_modules/
+outputs/
