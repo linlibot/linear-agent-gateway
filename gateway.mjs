@@ -5,6 +5,7 @@ import { GatewayError, LinearClient, loadSession, normalizeSession, MODEL, READ_
 import { WELCOME_HTML } from './welcome.mjs';
 import { ACCOUNTS_HTML } from './accounts-page.mjs';
 import { canFailOver } from './routing.mjs';
+import { KEYS_HTML } from './keys-page.mjs';
 
 export async function ensureAccess(runtimeDir) {
   await fs.mkdir(runtimeDir, { recursive: true });
@@ -40,7 +41,7 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   catch { throw new GatewayError(400, 'invalid_json', 'Request body is not valid JSON.'); }
 }
 
-export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
+export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
   let chain = Promise.resolve();
   let outstanding = 0;
   let accepting = true;
@@ -55,13 +56,29 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
       const requestUrl = new URL(req.url, 'http://localhost');
       const path = requestUrl.pathname;
       if (req.method === 'GET' && path === '/health') return json(res, 200, { status: 'ok', service: 'linear-agent-gateway', model: MODEL });
-      if (req.method === 'GET' && ['/', '/v1', '/v1/', '/index.html', '/accounts'].includes(path)) {
+      if (req.method === 'GET' && ['/', '/v1', '/v1/', '/index.html', '/accounts', '/keys'].includes(path)) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" });
-        return res.end(path === '/accounts' ? ACCOUNTS_HTML : WELCOME_HTML);
+        return res.end(path === '/accounts' ? ACCOUNTS_HTML : path === '/keys' ? KEYS_HTML : WELCOME_HTML);
       }
       if (req.method === 'GET' && path === '/ui/models') return json(res, 200, { object: 'list', data: await catalog() });
-      const key = Buffer.from(req.headers.authorization ?? '');
-      if (key.length !== expectedKey.length || !timingSafeEqual(key, expectedKey)) throw new GatewayError(401, 'invalid_api_key', 'A valid local Bearer API key is required.');
+      const authorization = req.headers.authorization ?? '';
+      const key = Buffer.from(authorization);
+      const administrator = key.length === expectedKey.length && timingSafeEqual(key, expectedKey);
+      const clientKey = !administrator && clientKeys && authorization.startsWith('Bearer ') ? await clientKeys.authenticate(authorization.slice(7)) : null;
+      if (!administrator && !clientKey) throw new GatewayError(401, 'invalid_api_key', 'A valid gateway Bearer API key is required.');
+      if (!administrator && (path.startsWith('/v1/accounts') || path === '/v1/routing' || path.startsWith('/v1/keys'))) throw new GatewayError(403, 'admin_key_required', 'Use the administrator key from access.json to manage accounts, routing or client keys.');
+      if (path.startsWith('/v1/keys')) {
+        if (!clientKeys) throw new GatewayError(503, 'keys_unavailable', 'Client key management is not configured.');
+        if (req.method === 'GET' && path === '/v1/keys') return json(res, 200, await clientKeys.list());
+        if (req.method === 'POST' && path === '/v1/keys') return json(res, 201, await clientKeys.create(await readBody(req, 4096)));
+        const match = path.match(/^\/v1\/keys\/(key-[a-f0-9]{20})\/status$/);
+        if (req.method === 'POST' && match) {
+          const body = await readBody(req, 4096);
+          if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(k => k !== 'enabled')) throw new GatewayError(400, 'invalid_client_key', 'Only enabled can be updated.');
+          return json(res, 200, await clientKeys.setEnabled(match[1], body.enabled));
+        }
+        throw new GatewayError(404, 'not_found', 'Client key endpoint not found.');
+      }
       if (path === '/v1/routing') {
         if (!accountRouter) throw new GatewayError(503, 'routing_unavailable', 'Account routing is not configured.');
         if (req.method === 'GET') return json(res, 200, await accountRouter.status());
@@ -113,65 +130,72 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
       res.once('close', () => { if (!res.writableEnded) controller.abort(new GatewayError(499, 'client_disconnected', 'Client disconnected.')); });
       const task = chain.then(async () => {
         controller.signal.throwIfAborted();
-        const plan = accountRouter ? await accountRouter.plan(input) : { accounts: [account], strategy: 'fixed', failover_enabled: false };
-        const attempted = [];
-        const id = 'chatcmpl-' + randomUUID();
-        const created = Math.floor(Date.now() / 1000);
-        const routingInfo = () => ({ strategy: plan.strategy, attempt_count: attempted.length, failover_count: Math.max(0, attempted.length - 1), attempted_account_ids: [...attempted] });
-        let result, selection;
-        for (const candidate of plan.accounts) {
-          controller.signal.throwIfAborted();
-          account = accountRouter ? { ...await accountStore.get(candidate.id), needsConversationCheck: candidate.needsConversationCheck } : candidate;
-          attempted.push(account?.id ?? null);
-          let accepted = false;
-          try {
-            if (accountRouter) await accountRouter.recordAttempt(account, { advanceCursor: plan.strategy === 'round_robin' });
-            const client = clientFactory ? await clientFactory(account) : new LinearClient(account ? normalizeSession(account.session) : await loadSession(sessionFile), { pollMs });
-            if (account?.needsConversationCheck) {
-              let conversation;
-              try { conversation = (await client.call(READ_QUERY, { id: input.conversationId }, controller.signal)).aiConversation; }
-              catch (error) { if (error.code !== 'linear_upstream_error') throw error; }
-              if (!conversation) throw new GatewayError(409, 'conversation_account_unknown', 'Cannot access this conversation with the selected account. Choose its original account or start a new conversation.');
+        if (clientKey) await clientKeys.begin(clientKey.id);
+        let completed = false;
+        try {
+          const plan = accountRouter ? await accountRouter.plan(input) : { accounts: [account], strategy: 'fixed', failover_enabled: false };
+          const attempted = [];
+          const id = 'chatcmpl-' + randomUUID();
+          const created = Math.floor(Date.now() / 1000);
+          const routingInfo = () => ({ strategy: plan.strategy, attempt_count: attempted.length, failover_count: Math.max(0, attempted.length - 1), attempted_account_ids: [...attempted] });
+          let result, selection;
+          for (const candidate of plan.accounts) {
+            controller.signal.throwIfAborted();
+            account = accountRouter ? { ...await accountStore.get(candidate.id), needsConversationCheck: candidate.needsConversationCheck } : candidate;
+            attempted.push(account?.id ?? null);
+            let accepted = false;
+            try {
+              if (accountRouter) await accountRouter.recordAttempt(account, { advanceCursor: plan.strategy === 'round_robin' });
+              const client = clientFactory ? await clientFactory(account) : new LinearClient(account ? normalizeSession(account.session) : await loadSession(sessionFile), { pollMs });
+              if (account?.needsConversationCheck) {
+                let conversation;
+                try { conversation = (await client.call(READ_QUERY, { id: input.conversationId }, controller.signal)).aiConversation; }
+                catch (error) { if (error.code !== 'linear_upstream_error') throw error; }
+                if (!conversation) throw new GatewayError(409, 'conversation_account_unknown', 'Cannot access this conversation with the selected account. Choose its original account or start a new conversation.');
+              }
+              selection = { requested_model: input.requestedModel === MODEL ? null : input.requestedModel, model_selection_verified: false, requested_reasoning_effort: input.reasoningEffort ?? null, reasoning_effort_verified: false, account_id: account?.id ?? null, ...(accountRouter ? { routing: routingInfo() } : {}), ...(input.compatibility ? { compatibility: input.compatibility } : {}) };
+              result = await client.chat(input, controller.signal, async conversationId => {
+                // Once Linear accepts a send, replay could duplicate its native tool actions.
+                accepted = true;
+                if (account) await accountStore.pin(conversationId, account.id);
+                controller.signal.throwIfAborted();
+                res.setHeader('x-linear-conversation-id', conversationId);
+                res.setHeader('x-linear-requested-model', input.requestedModel);
+                res.setHeader('x-linear-requested-reasoning-effort', input.reasoningEffort ?? 'auto');
+                if (input.compatibility) res.setHeader('x-linear-client-tools', 'unavailable; text-only');
+                if (account) res.setHeader('x-linear-account-id', account.id);
+                if (accountRouter) {
+                  res.setHeader('x-linear-attempts', String(attempted.length));
+                  res.setHeader('x-linear-routing-strategy', plan.strategy);
+                }
+                if (input.stream) {
+                  res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no' });
+                  res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }) + '\n\n');
+                  heartbeat = setInterval(() => { if (!res.destroyed) res.write(': waiting for Linear\n\n'); }, 15000);
+                }
+              });
+              if (accountRouter) await accountRouter.recordSuccess(account).catch(() => onError({ code: 'routing_store_unavailable', status: 503 }));
+              break;
+            } catch (error) {
+              let recorded = true;
+              if (accountRouter) await accountRouter.recordFailure(account, error).catch(() => { recorded = false; onError({ code: 'routing_store_unavailable', status: 503 }); });
+              if (accountRouter && plan.failover_enabled && recorded && !accepted && canFailOver(error) && attempted.length < plan.accounts.length && !controller.signal.aborted) continue;
+              if (accountRouter && error instanceof GatewayError) error.routing = routingInfo();
+              throw error;
             }
-            selection = { requested_model: input.requestedModel === MODEL ? null : input.requestedModel, model_selection_verified: false, requested_reasoning_effort: input.reasoningEffort ?? null, reasoning_effort_verified: false, account_id: account?.id ?? null, ...(accountRouter ? { routing: routingInfo() } : {}), ...(input.compatibility ? { compatibility: input.compatibility } : {}) };
-            result = await client.chat(input, controller.signal, async conversationId => {
-              // Once Linear accepts a send, replay could duplicate its native tool actions.
-              accepted = true;
-              if (account) await accountStore.pin(conversationId, account.id);
-              controller.signal.throwIfAborted();
-              res.setHeader('x-linear-conversation-id', conversationId);
-              res.setHeader('x-linear-requested-model', input.requestedModel);
-              res.setHeader('x-linear-requested-reasoning-effort', input.reasoningEffort ?? 'auto');
-              if (input.compatibility) res.setHeader('x-linear-client-tools', 'unavailable; text-only');
-              if (account) res.setHeader('x-linear-account-id', account.id);
-              if (accountRouter) {
-                res.setHeader('x-linear-attempts', String(attempted.length));
-                res.setHeader('x-linear-routing-strategy', plan.strategy);
-              }
-              if (input.stream) {
-                res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no' });
-                res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }) + '\n\n');
-                heartbeat = setInterval(() => { if (!res.destroyed) res.write(': waiting for Linear\n\n'); }, 15000);
-              }
-            });
-            if (accountRouter) await accountRouter.recordSuccess(account).catch(() => onError({ code: 'routing_store_unavailable', status: 503 }));
-            break;
-          } catch (error) {
-            let recorded = true;
-            if (accountRouter) await accountRouter.recordFailure(account, error).catch(() => { recorded = false; onError({ code: 'routing_store_unavailable', status: 503 }); });
-            if (accountRouter && plan.failover_enabled && recorded && !accepted && canFailOver(error) && attempted.length < plan.accounts.length && !controller.signal.aborted) continue;
-            if (accountRouter && error instanceof GatewayError) error.routing = routingInfo();
-            throw error;
           }
+          if (controller.signal.aborted || res.destroyed) return;
+          if (input.stream) {
+            const chunk = (delta, finish_reason) => ({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [{ index: 0, delta, finish_reason }] });
+            res.write('data: ' + JSON.stringify(chunk({ content: result.text }, null)) + '\n\n');
+            res.write('data: ' + JSON.stringify(chunk({}, 'stop')) + '\n\n');
+            if (input.includeUsage) res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [], usage: null }) + '\n\n');
+            res.end('data: [DONE]\n\n');
+          } else json(res, 200, { id, object: 'chat.completion', created, model: MODEL, ...selection, choices: [{ index: 0, message: { role: 'assistant', content: result.text }, finish_reason: 'stop' }], usage: null, conversation_id: result.conversationId });
+          completed = true;
+        } finally {
+          if (clientKey) await clientKeys.finish(clientKey.id, completed).catch(() => onError({ code: 'key_store_unavailable', status: 503 }));
         }
-        if (controller.signal.aborted || res.destroyed) return;
-        if (input.stream) {
-          const chunk = (delta, finish_reason) => ({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [{ index: 0, delta, finish_reason }] });
-          res.write('data: ' + JSON.stringify(chunk({ content: result.text }, null)) + '\n\n');
-          res.write('data: ' + JSON.stringify(chunk({}, 'stop')) + '\n\n');
-          if (input.includeUsage) res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [], usage: null }) + '\n\n');
-          res.end('data: [DONE]\n\n');
-        } else json(res, 200, { id, object: 'chat.completion', created, model: MODEL, ...selection, choices: [{ index: 0, message: { role: 'assistant', content: result.text }, finish_reason: 'stop' }], usage: null, conversation_id: result.conversationId });
       });
       chain = task.catch(() => {});
       try { await task; } finally { outstanding--; }

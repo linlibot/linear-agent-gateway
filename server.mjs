@@ -5,6 +5,7 @@ import { AccountStore } from './accounts.mjs';
 import { loadModelEntries, modelEntries } from './models.mjs';
 import { AccountRouter } from './routing.mjs';
 import { readConfig } from './config.mjs';
+import { ClientKeyStore } from './client-keys.mjs';
 
 const config = readConfig();
 const runtimeDir = new URL('./.local-runtime/', import.meta.url);
@@ -21,7 +22,9 @@ const modelsProvider = async accountId => {
 };
 const accountRouter = new AccountRouter(accounts, { modelsProvider });
 await accountRouter.initialize();
-const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, modelsProvider, pollMs: config.pollMs, timeoutMs: config.timeoutMs, onError: event => console.error(JSON.stringify(event)) });
+const clientKeys = new ClientKeyStore(runtimeDir, { adminKey: access.api_key });
+await clientKeys.initialize();
+const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, modelsProvider, pollMs: config.pollMs, timeoutMs: config.timeoutMs, onError: event => console.error(JSON.stringify(event)) });
 server.listen(config.port, config.host, () => {
   const address = config.host.includes(':') ? `[${config.host}]` : config.host;
   console.log(`Linear Agent gateway: http://${address}:${config.port}/v1`);

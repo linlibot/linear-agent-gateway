@@ -13,6 +13,7 @@ import { ENDPOINT, GatewayError } from '../upstream.mjs';
 import { loadModelEntries } from '../models.mjs';
 import { ACCOUNTS_HTML } from '../accounts-page.mjs';
 import { WELCOME_HTML } from '../welcome.mjs';
+import { KEYS_HTML } from '../keys-page.mjs';
 
 const session = (user='user-a', organization='org-a', cookie='TEST_COOKIE_A') => ({ endpoint:ENDPOINT, headers:{cookie,user,organization} });
 const response = data => new Response(JSON.stringify({data}),{headers:{'content-type':'application/json'}});
@@ -176,8 +177,8 @@ test('account APIs require the local key and return only safe account metadata',
   assert.equal((await request('/v1/accounts/import',{credential:{log:{entries:{}}}})).status,400);
 });
 
-test('both browser pages contain syntactically valid scripts',()=>{
-  for(const html of [ACCOUNTS_HTML,WELCOME_HTML]) {
+test('all browser pages contain syntactically valid scripts',()=>{
+  for(const html of [ACCOUNTS_HTML,WELCOME_HTML,KEYS_HTML]) {
     const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
     assert.doesNotThrow(()=>new vm.Script(script));
   }

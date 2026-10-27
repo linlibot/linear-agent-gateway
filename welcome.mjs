@@ -14,7 +14,7 @@ export const WELCOME_HTML = String.raw`<!doctype html>
 <section class="card"><div class="headrow"><h2 style="margin:0">客户端接入</h2><span class="pill">Chat Completions</span></div>
 <div class="label">API Base URL</div><div class="field"><code id="base"></code></div><button id="copy" style="margin-top:9px">复制地址</button>
 <div class="label">模型入口</div><div class="field"><code>linear-agent</code></div><p class="note">右侧模型列表中的已测参数也可填入客户端的 model 字段。</p>
-<div class="label">本地 API Key</div><div class="field"><code>.local-runtime/access.json → api_key</code></div><p class="note">密钥位于程序目录中。网页不会自动读取或保存密钥。</p>
+<div class="label">调用 API Key</div><div class="field"><a href="/keys" target="_blank" rel="noopener">创建和管理自己的调用 Key →</a></div><p class="note">用管理员 Key 登录管理页后，自行生成或填写调用 Key，再填入客户端。调用会使用已导入的 Linear 账号池。</p>
 <p class="note">添加或更新 Linear 登录凭证，请打开 <a href="/accounts" target="_blank" rel="noopener">账户管理</a>。每个账户分别导入，不能把 Cookie 填进本地 API Key 输入框。</p>
 <p class="note">API Base URL 是给客户端使用的接口前缀；现在直接打开 <code>/v1</code> 也会显示本页。</p>
 </section>
@@ -22,13 +22,13 @@ export const WELCOME_HTML = String.raw`<!doctype html>
 <form id="chat"><label for="model">模型请求参数</label><select id="model" aria-label="模型请求参数"><option value="linear-agent">Linear 默认配置</option></select>
 <p class="note" id="modelnote">候选模型名通过请求与回复测试后才会出现在列表中。上游未返回可核验的实际模型身份。</p>
 <label for="effort">思考强度</label><select id="effort" aria-label="思考强度"><option value="auto">默认（跟随 Linear）</option><option value="low">低 · Low</option><option value="medium">中 · Medium</option><option value="high">高 · High</option></select><p class="note">低 / 中 / 高为请求档位，实际计算预算仍由 Linear 决定。</p>
-<label for="key">本地 API Key</label><input id="key" type="password" autocomplete="off" placeholder="粘贴 access.json 中的 api_key" required>
+<label for="key">API Key</label><input id="key" type="password" autocomplete="off" placeholder="粘贴自己创建的调用 Key，或原管理员 Key" required>
 <label for="account">使用账户</label><div class="headrow" style="gap:10px"><select id="account" aria-label="使用账户"><option value="">自动选号（按账户策略）</option></select><button id="accounts-refresh" type="button">刷新账户</button></div><p class="note"><a href="/accounts" target="_blank" rel="noopener">账户与轮转策略</a> · 自动选号按策略分配新对话；手动选择和续聊使用固定账户。</p>
 <div id="messages" class="messages" aria-live="polite"><div class="empty" id="empty">发送第一条消息，开始一个新对话</div></div>
 <label for="prompt">消息</label><textarea id="prompt" placeholder="例如：请用一句话介绍你能做什么" required></textarea>
 <div class="actions"><span id="state" class="muted">准备就绪</span><button id="send" class="primary" type="submit">发送消息</button></div></form>
 </section></div>
-<footer>服务仅监听本机地址。当前通过轮询获取完整回复；SSE 为缓冲输出。<a href="/health" target="_blank" rel="noopener">查看健康状态</a></footer>
+<footer>Compose 默认只映射宿主机本机端口。当前通过轮询获取完整回复；SSE 为缓冲输出。<a href="/health" target="_blank" rel="noopener">查看健康状态</a></footer>
 </main>
 <script>
 const $=id=>document.getElementById(id);let conversationId=null;let conversationAccountId=null;let busy=false;
@@ -39,8 +39,8 @@ function reset(){conversationId=null;conversationAccountId=null;$('messages').re
 $('new').onclick=()=>{if(!busy)reset();};$('model').onchange=()=>{if(!busy)reset();};
 function modelOptions(list){const previous=$('model').value;$('model').replaceChildren();for(const model of list.data){const option=document.createElement('option');option.value=model.id;option.textContent=model.name+(model.test_status==='reply_received'?' · 参数已实测':'');$('model').append(option);}if([...$('model').options].some(o=>o.value===previous))$('model').value=previous;}
 async function refreshModels(){const key=$('key').value.trim();const account=conversationAccountId||$('account').value;const response=await fetch(key?'/v1/models'+(account?'?account_id='+encodeURIComponent(account):''):'/ui/models',{headers:key?{authorization:'Bearer '+key}:{}});const data=await response.json();if(!response.ok)throw Error(data.error?.message??'读取模型列表失败');modelOptions(data);}
-async function refreshAccounts(){const key=$('key').value.trim();if(!key)throw Error('请先填写本地 API Key。');const response=await fetch('/v1/accounts',{headers:{authorization:'Bearer '+key}});const data=await response.json();if(!response.ok)throw Error(data.error?.message??'读取账户失败');const selected=$('account').value;const defaultAccount=data.data.find(a=>a.id===data.default_account_id);$('account').replaceChildren();const option=document.createElement('option');option.value='';option.textContent=data.routing_policy?.strategy==='round_robin'?'自动选号 · 按新对话轮转':'自动选号 · 固定默认'+(defaultAccount?'（'+defaultAccount.label+'）':'');$('account').append(option);for(const account of data.data){const item=document.createElement('option');item.value=account.id;item.textContent='固定 · '+account.label;$('account').append(item);}if([...$('account').options].some(o=>o.value===selected))$('account').value=selected;await refreshModels();}
-$('accounts-refresh').onclick=()=>refreshAccounts().then(()=>{$('state').textContent='账户列表已更新';}).catch(e=>{$('state').textContent=e.message;});$('key').onchange=()=>{if($('key').value.trim())refreshAccounts().catch(e=>{$('state').textContent=e.message;});};$('account').onchange=()=>{if(!busy){reset();refreshModels().catch(e=>{$('state').textContent=e.message;});}};
+async function refreshAccounts(){const key=$('key').value.trim();if(!key)throw Error('请先填写 API Key。');const response=await fetch('/v1/accounts',{headers:{authorization:'Bearer '+key}});const data=await response.json();if(response.status===403&&data.error?.code==='admin_key_required'){$('account').replaceChildren();const automatic=document.createElement('option');automatic.value='';automatic.textContent='自动选号 · 使用已配置的账号池';$('account').append(automatic);await refreshModels();return false;}if(!response.ok)throw Error(data.error?.message??'读取账户失败');const selected=$('account').value;const defaultAccount=data.data.find(a=>a.id===data.default_account_id);$('account').replaceChildren();const option=document.createElement('option');option.value='';option.textContent=data.routing_policy?.strategy==='round_robin'?'自动选号 · 按新对话轮转':'自动选号 · 固定默认'+(defaultAccount?'（'+defaultAccount.label+'）':'');$('account').append(option);for(const account of data.data){const item=document.createElement('option');item.value=account.id;item.textContent='固定 · '+account.label;$('account').append(item);}if([...$('account').options].some(o=>o.value===selected))$('account').value=selected;await refreshModels();return true;}
+const refreshed=admin=>{$('state').textContent=admin?'账户列表已更新':'调用 Key 已就绪 · 使用账号池自动选号';};$('accounts-refresh').onclick=()=>refreshAccounts().then(refreshed).catch(e=>{$('state').textContent=e.message;});$('key').onchange=()=>{if(!busy){reset();if($('key').value.trim())refreshAccounts().then(refreshed).catch(e=>{$('state').textContent=e.message;});}};$('account').onchange=()=>{if(!busy){reset();refreshModels().catch(e=>{$('state').textContent=e.message;});}};
 Promise.all([fetch('/health').then(r=>r.json()),fetch('/ui/models').then(r=>r.json())]).then(([health,list])=>{
 if(health.status!=='ok')throw Error('unhealthy');$('status').textContent='本地服务运行中';$('status').classList.add('ok');
 modelOptions(list);
