@@ -2,11 +2,11 @@
 
 将本人 Linear 账号已经开放的内置 Agent 对话接入本地 Chat Completions 客户端。使用网页实际调用的 `client-api.linear.app/graphql`，发送 `AiConversationSendMessage`，再读取当前 assistant turn 的最终回复。
 
-浏览器页面与 API Base URL 均为 `http://127.0.0.1:8089/v1`。默认模型入口为 `linear-agent`，也可选择已实测的模型请求参数。无第三方运行依赖，需要 Node.js 22 或更新版本。
+浏览器页面与 API Base URL 均为 `http://127.0.0.1:8089/v1`。默认模型入口为 `linear-agent`，也可选择已实测的模型请求参数。支持 Node.js 22 或更新版本直接启动，也支持 Docker Compose 部署，无第三方运行依赖。
 
 ## 启动与客户端设置
 
-本次网页登录会话会自动迁入本机多账户存储。也可以先启动服务，再通过账户管理页导入凭证。在本目录运行：
+全新安装不含任何 Linear 账号，先启动服务，再通过账户管理页导入凭证；已有的旧会话文件会自动迁入本机多账户存储。在本目录运行：
 
 ```powershell
 .\scripts\start-local.ps1
@@ -49,7 +49,7 @@
 
 这些名称会原样传入上游 `AiConversationSendMessageInput.model`。测试只确认请求被接受并收到回复，尚未核验实际底层模型身份。因此响应中的 `model` 保留为 `linear-agent`，额外用 `requested_model` 标明请求参数，`model_selection_verified` 为 `false`。
 
-首次启动会生成独立的本地 API Key。进程只监听 `127.0.0.1`。本地 Key 与 Linear 的会话 Cookie 分开存放；日志不输出 Cookie 或 Key。
+首次启动会生成独立的本地 API Key。本地启动默认只监听 `127.0.0.1`；Docker 容器内监听 `0.0.0.0`，Compose 默认仍只将端口映射到宿主机的 `127.0.0.1`。本地 Key 与 Linear 的会话 Cookie 分开存放；日志不输出 Cookie 或 Key。
 
 ```powershell
 $linearAccess = Get-Content .\.local-runtime\access.json -Raw | ConvertFrom-Json
@@ -63,7 +63,64 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8089/v1/chat/completions' `
     -Body ([Text.Encoding]::UTF8.GetBytes($linearBody))
 ```
 
-停止：`./scripts/stop-local.ps1`。可用环境变量：`LINEAR_PORT`（默认 8089）、`LINEAR_SESSION_FILE`（首次迁移使用的旧会话文件绝对路径）、`LINEAR_POLL_MS`（默认 1500，最小 500）、`LINEAR_TIMEOUT_MS`（默认 180000）。
+停止：`./scripts/stop-local.ps1`。可用环境变量：`LINEAR_HOST`（默认 `127.0.0.1`，须为 IPv4 或 IPv6 地址）、`LINEAR_PORT`（默认 8089）、`LINEAR_SESSION_FILE`（首次迁移使用的旧会话文件绝对路径）、`LINEAR_POLL_MS`（默认 1500，最小 500）、`LINEAR_TIMEOUT_MS`（默认 180000）。
+
+## Docker 部署
+
+0.6.0 起提供 Dockerfile 和 Compose 配置，使用官方 `node:24-alpine` 镜像，以非 root 用户运行。构建过程中执行全部本地测试；不需要在宿主机安装 Node.js。安装 Docker Engine / Docker Desktop 及 Compose 插件后运行：
+
+```sh
+git clone https://github.com/linlibot/linear-agent-gateway.git
+cd linear-agent-gateway
+docker compose up -d --build
+docker compose ps
+```
+
+打开 [对话页](http://127.0.0.1:8089/v1) 或 [账户管理](http://127.0.0.1:8089/accounts)。首次启动会创建空账户存储和新的本地 API Key。下面的命令在你自己的终端显示 Key，复制到客户端或管理页使用：
+
+```sh
+docker compose exec gateway node -p "JSON.parse(require('node:fs').readFileSync('/app/.local-runtime/access.json','utf8')).api_key"
+```
+
+通过账户管理页导入 HAR / 会话 JSON，即可添加账号。API Base URL 仍是 `http://127.0.0.1:8089/v1`。镜像不包含开发者账号、Cookie、本地密钥、HAR 或生成结果；全新数据卷的模型目录初始只有 `linear-agent`，导入账号后可在容器内运行 `docker compose exec gateway node scripts/test-models.mjs`，按该账号的真实测试结果开放其他模型。
+
+账户、API Key、模型成功记录、对话绑定、轮转策略和冷却状态全部保存在 `linear-data` 命名卷中，挂载到 `/app/.local-runtime`。更新、重启或执行 `docker compose down` 后重新启动均会保留这些数据。请勿给有用数据的 `down` 命令添加 `--volumes` / `-v`，该选项会删除数据卷。Docker 的健康检查验证本地服务是否响应，不代表 Linear 登录仍然有效。
+
+可将 `.env.example` 复制为 `.env`，修改宿主机端口、轮询间隔或总超时。例如 `LINEAR_PORT=8090` 会将宿主机 `8090` 映射到容器 `8089`；容器内部端口保持不变。如果本机已经运行旧网关，可改用其他宿主机端口，或先停止旧网关再使用 8089。
+
+服务器上部署时，默认端口仍只对服务器本机开放。可以通过 SSH 转发，在自己的电脑继续使用上述本地地址：
+
+```sh
+ssh -L 8089:127.0.0.1:8089 user@your-server
+```
+
+查看日志、更新和停止：
+
+```sh
+docker compose logs --tail=100 -f gateway
+git pull --ff-only
+docker compose up -d --build
+docker compose down
+```
+
+备份或迁移现有账户时，先停止网关以取得一致快照。下面把容器中的整个运行目录备份到本机；这个目录已被 Git 忽略，仍应只在自己的机器之间传递：
+
+```sh
+docker compose stop gateway
+docker compose cp gateway:/app/.local-runtime ./linear-data-backup
+docker compose up -d
+```
+
+将旧的本地 `.local-runtime` 迁入已经创建的 Docker 服务时，先停止旧网关及容器，再复制并修正卷内文件所有者：
+
+```sh
+docker compose stop gateway
+docker compose cp ./.local-runtime/. gateway:/app/.local-runtime/
+docker compose run --rm --no-deps --user root gateway chown -R node:node /app/.local-runtime
+docker compose up -d
+```
+
+替换目标卷前先备份其中原有数据。不要让两个网关实例同时写入同一份运行目录。`.dockerignore` 采用允许列表，账户运行目录、备份、HAR、`.env`、Git 历史和生成结果均不会进入构建上下文。GitHub Actions 的 Docker 工作流会验证镜像构建、端口映射、鉴权、非 root 运行和容器重建后的状态持久化。
 
 ## 对话方式
 
@@ -186,6 +243,6 @@ node --preserve-symlinks --preserve-symlinks-main .\scripts\smoke-test.mjs
 
 可设置 `LINEAR_TEST_MODEL=openai/gpt-6.1-sol` 让 smoke test 验证指定模型参数；`LINEAR_TEST_EFFORT=high` 验证指定强度及 JSON、原生续聊、SSE 的档位标识。真实测试均可用 `LINEAR_ACCOUNT_ID=acct-…` 指定账户；未指定时，候选模型探测使用默认账户，smoke test 的新对话遵循当前选号策略，续聊固定原账户。模型列表按账户读取 `.local-runtime/model-validations/{account_id}.json`，不存在或读取失败时仅开放默认入口；原模型报告只迁移到原账户。
 
-2026-10-27 验证：41 项本地测试通过，覆盖多账户导入、凭证校验、存储恢复、模型证据隔离、默认账户切换、续聊绑定、鉴权、取消、SSE、Cherry 自动附带工具的 HTML 生成请求、强度参数透传，以及三账户轮转、换号重试、冷却恢复、凭证刷新、策略持久化和已接受请求不重放。多账户轮转与故障转移使用独立临时目录中的模拟账户验证。真实聊天记录保存在本机 `.local-runtime/live-validation.json`，强度原始测试位于 `.local-runtime/reasoning-validation.json`；本次上线验证记录见 `.local-runtime/routing-live-validation.json`。
+2026-10-27 验证：45 项本地测试通过，覆盖多账户导入、凭证校验、存储恢复、模型证据隔离、默认账户切换、续聊绑定、鉴权、取消、SSE、Cherry 自动附带工具的 HTML 生成请求、强度参数透传，以及三账户轮转、换号重试、冷却恢复、凭证刷新、策略持久化和已接受请求不重放。0.6.0 新增监听配置校验、无凭证首次启动及重启后密钥和策略保留测试。多账户轮转与故障转移使用独立临时目录中的模拟账户验证。真实聊天记录保存在本机 `.local-runtime/live-validation.json`，强度原始测试位于 `.local-runtime/reasoning-validation.json`；轮转上线验证记录见 `.local-runtime/routing-live-validation.json`。Docker 的实际构建、启动与重建测试结果见 [Docker 工作流](https://github.com/linlibot/linear-agent-gateway/actions/workflows/docker.yml)。
 
 Cherry 提示 `Parameter tools is not supported` 时，升级至 0.3.1 并重启网关即可兼容普通文本 / HTML 代码生成，不需要删除自动附带的工具定义。这个兼容处理不会启用 Cherry 的文件读取、联网搜索或 MCP；需要这些外部工具时，应使用支持完整工具往返的后端。HTML 代码可以在 Cherry 中复制或预览，不会自动写入本机文件。

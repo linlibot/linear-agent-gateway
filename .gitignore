@@ -7,3 +7,5 @@
 *.log
 node_modules/
 outputs/
+linear-data-backup/
+compose.override.yaml

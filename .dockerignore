@@ -1,0 +1,14 @@
+**
+!package.json
+!*.mjs
+!test/
+!test/*.mjs
+!scripts/
+!scripts/*.mjs
+.git/
+.local-runtime/
+outputs/
+.private/
+linear-data-backup/
+**/*.har
+**/.env*

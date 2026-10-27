@@ -1,0 +1,49 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COMPOSE_PROJECT_NAME: linear-agent-ci
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Prepare excluded build canaries
+        run: |
+          mkdir -p .local-runtime outputs .private
+          printf 'build-canary' > .local-runtime/build-canary.txt
+          printf 'build-canary' > outputs/build-canary.txt
+          printf 'build-canary' > .private/build-canary.txt
+          printf 'CONTAINER_BUILD_CANARY=1\n' > .env
+          printf 'build-canary' > credential-canary.har
+      - name: Validate Compose
+        run: docker compose config --quiet
+      - name: Build image and run unit tests
+        run: docker compose build --pull
+      - name: Start gateway
+        run: docker compose up -d --wait --wait-timeout 90
+      - name: Verify published port
+        run: curl --fail --silent http://127.0.0.1:8089/health
+      - name: Verify container behavior
+        run: docker compose exec -T -e LINEAR_CONTAINER_TEST=1 gateway node scripts/smoke-container.mjs
+      - name: Recreate container with the same volume
+        run: |
+          docker compose down
+          docker compose up -d --wait --wait-timeout 90
+      - name: Verify persisted state
+        run: docker compose exec -T -e LINEAR_CONTAINER_TEST=1 gateway node scripts/smoke-container.mjs --verify-restart
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=100
+      - name: Clean up disposable CI resources
+        if: always()
+        run: docker compose down --volumes
