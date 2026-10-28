@@ -7,6 +7,8 @@ import { AccountRouter } from './routing.mjs';
 import { readConfig } from './config.mjs';
 import { ClientKeyStore } from './client-keys.mjs';
 import { AdminAuth } from './admin-auth.mjs';
+import { CredentialSync } from './credential-sync.mjs';
+import { ToolSessionStore } from './tool-sessions.mjs';
 
 const config = readConfig();
 const runtimeDir = new URL('./.local-runtime/', import.meta.url);
@@ -27,12 +29,17 @@ const clientKeys = new ClientKeyStore(runtimeDir, { adminKey: access.api_key });
 await clientKeys.initialize();
 const adminAuth = new AdminAuth(runtimeDir, { bootstrapKey: access.api_key, publicOrigin: process.env.LINEAR_PUBLIC_URL });
 await adminAuth.initialize();
-const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, adminAuth, modelsProvider, pollMs: config.pollMs, timeoutMs: config.timeoutMs, onError: event => console.error(JSON.stringify(event)) });
+const credentialSync = new CredentialSync(runtimeDir, accounts); await credentialSync.initialize();
+const onError = event => console.error(JSON.stringify(event));
+const toolSessions = new ToolSessionStore(runtimeDir, { ttlMs: config.toolSessions.ttlSeconds * 1000, idempotencyMs: config.toolSessions.idempotencySeconds * 1000, onError });
+await toolSessions.initialize();
+const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, adminAuth, credentialSync, modelsProvider, toolSessions, pollMs: config.pollMs, timeoutMs: config.timeoutMs, maxConcurrency: config.maxConcurrency, accountConcurrency: config.accountConcurrency, maxQueue: config.maxQueue, maxBodyBytes: config.maxBodyBytes, chat: config.chat, onError });
 server.listen(config.port, config.host, () => {
   const address = config.host.includes(':') ? `[${config.host}]` : config.host;
   console.log(`Linear Agent gateway: http://${address}:${config.port}/v1`);
   console.log(`Administrator setup/login: http://${address}:${config.port}/login`);
   console.log(`Initialization key file: ${fileURLToPath(new URL('access.json', runtimeDir))}`);
+  console.log(`Client tools: ${config.chat.clientTools === 'off' ? 'off (text-only compatibility)' : 'structured-output adapter (experimental)'}; streaming: ${config.chat.streamMode}; concurrency: ${config.maxConcurrency} global / ${config.accountConcurrency} per account, ${config.maxQueue} outstanding.`);
 });
 server.on('error', error => { console.error(`Gateway startup failed: ${error.code ?? 'unknown'}`); process.exitCode = 1; });
 let stopping = false;

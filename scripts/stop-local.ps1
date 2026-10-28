@@ -7,6 +7,6 @@ $linearProcess = Get-CimInstance Win32_Process -Filter ('ProcessId = {0}' -f $li
 if (-not $linearProcess) { Write-Output 'Gateway is already stopped.'; exit 0 }
 $linearExpectedEntry = Join-Path $linearProjectDir 'server.mjs'
 if ($linearProcess.Name -ne 'node.exe' -or -not $linearProcess.CommandLine.Contains($linearExpectedEntry)) { throw 'PID does not belong to this Linear gateway; refusing to stop it.' }
-Stop-Process -Id $linearProcessId
+Stop-Process -Id $linearProcessId -Force
 Remove-Item -LiteralPath $linearPidFile
 Write-Output 'Linear gateway stopped.'

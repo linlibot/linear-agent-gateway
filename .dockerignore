@@ -10,6 +10,7 @@ browser-extension/*
 !browser-extension/manifest.json
 !browser-extension/background.mjs
 !browser-extension/capture.mjs
+!browser-extension/sync.mjs
 !browser-extension/popup.mjs
 !browser-extension/popup.html
 !browser-extension/popup.css

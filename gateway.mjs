@@ -1,13 +1,16 @@
 import http from 'node:http';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { GatewayError, LinearClient, loadSession, normalizeSession, MODEL, READ_QUERY, validateRequest } from './upstream.mjs';
+import { GatewayError, MODEL } from './upstream.mjs';
 import { WELCOME_HTML } from './welcome.mjs';
 import { ACCOUNTS_HTML } from './accounts-page.mjs';
-import { canFailOver } from './routing.mjs';
+import { Scheduler } from './scheduler.mjs';
+import { ToolSessionStore } from './tool-sessions.mjs';
+import { createChatCompletions } from './chat-completions.mjs';
 import { KEYS_HTML } from './keys-page.mjs';
 import { LOGIN_HTML, SETUP_HTML, SECURITY_HTML } from './admin-pages.mjs';
 import { captureExtensionArchive } from './capture-extension.mjs';
+import { isExtensionOrigin } from './credential-sync.mjs';
 
 export async function ensureAccess(runtimeDir) {
   await fs.mkdir(runtimeDir, { recursive: true });
@@ -48,21 +51,40 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   catch { throw new GatewayError(400, 'invalid_json', 'Request body is not valid JSON.'); }
 }
 
-export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, adminAuth, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
-  let chain = Promise.resolve();
-  let outstanding = 0;
+export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, adminAuth, credentialSync, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, maxConcurrency = 4, accountConcurrency = 1, maxBodyBytes = 8 * 1024 * 1024, chat = {}, toolSessions = new ToolSessionStore(null), clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
   let accepting = true;
   const controllers = new Set();
+  const requests = new Set();
   const expectedKey = Buffer.from('Bearer ' + apiKey);
   const catalog = accountId => accountRouter ? accountRouter.models(accountId) : modelsProvider(accountId);
+  const scheduler = new Scheduler({ maxConcurrency, accountConcurrency, maxQueue });
+  const completions = createChatCompletions({ accountStore, accountRouter, clientKeys, sessionFile, modelsProvider, catalog, clientFactory, pollMs, timeoutMs, scheduler, toolSessions, settings: chat, onError, controllers });
   const server = http.createServer(async (req, res) => {
-    let controller;
-    let timer;
-    let heartbeat;
+    let finish;
+    const completion = new Promise(resolve => { finish = resolve; });
+    requests.add(completion);
     try {
       const requestUrl = new URL(req.url, 'http://localhost');
       const path = requestUrl.pathname;
       if (req.method === 'GET' && path === '/health') return json(res, 200, { status: 'ok', service: 'linear-agent-gateway', model: MODEL });
+      if (['/sync/pair', '/sync/credentials', '/sync/revoke'].includes(path)) {
+        const origin = req.headers.origin, claimed = req.headers['x-linear-sync-origin'];
+        if (req.method === 'OPTIONS') {
+          if (!isExtensionOrigin(origin)) throw new GatewayError(403, 'invalid_sync_origin', 'Only a browser extension may request credential sync access.');
+          res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'POST', 'access-control-allow-headers': 'content-type, authorization, x-linear-sync-origin', 'access-control-max-age': '600', vary: 'Origin' }); return res.end();
+        }
+        if (!isExtensionOrigin(claimed) || (origin && origin !== claimed)) throw new GatewayError(403, 'invalid_sync_origin', 'The browser extension origin does not match.');
+        if (origin) { res.setHeader('access-control-allow-origin', origin); res.setHeader('vary', 'Origin'); }
+        if (req.method !== 'POST') throw new GatewayError(404, 'not_found', 'Sync endpoint not found.');
+        if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) throw new GatewayError(415, 'json_required', 'Credential sync requests must use JSON.');
+        if (!credentialSync) throw new GatewayError(503, 'sync_unavailable', 'Credential sync is not configured.');
+        const body = await readBody(req, path === '/sync/credentials' ? 256 * 1024 : 8192);
+        if (path === '/sync/pair') return json(res, 200, await credentialSync.pair(body, claimed, req.socket.remoteAddress ?? 'unknown'));
+        const authorization = req.headers.authorization ?? '', token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+        if (path === '/sync/credentials') return json(res, 200, await credentialSync.receive(body, token, claimed));
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) throw new GatewayError(400, 'invalid_sync_request', 'Expected an empty revoke request.');
+        return json(res, 200, await credentialSync.revokeToken(token, claimed));
+      }
       if (adminAuth && req.method === 'GET' && ['/login', '/setup', '/admin', '/admin/security', '/accounts', '/keys', '/admin/capture-extension.zip'].includes(path)) {
         const configured = await adminAuth.configured(), session = await adminAuth.session(req);
         if (!configured) return path === '/setup' ? html(res, SETUP_HTML) : redirect(res, '/setup');
@@ -145,6 +167,10 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
             list.routing_policy = routing.policy;
             list.data = list.data.map(a => ({ ...a, routing: routing.accounts.find(v => v.id === a.id) }));
           }
+          if (credentialSync) {
+            const sync = await credentialSync.list();
+            list.data = list.data.map(a => ({ ...a, credential_sync: sync.data.filter(g => g.account_id === a.id) }));
+          }
           return json(res, 200, list);
         }
         if (req.method === 'POST' && path === '/v1/accounts/import') {
@@ -152,6 +178,15 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
           const imported = await accountStore.import(body?.credential, body?.label ?? '');
           const account = await accountStore.check(imported.account.id);
           return json(res, 200, { ...imported, account });
+        }
+        const syncMatch = path.match(/^\/v1\/accounts\/(acct-[a-f0-9]{20})\/sync(?:\/(pairing|revoke))?$/);
+        if (syncMatch) {
+          if (!credentialSync) throw new GatewayError(503, 'sync_unavailable', 'Credential sync is not configured.');
+          await accountStore.get(syncMatch[1]);
+          if (req.method === 'GET' && !syncMatch[2]) return json(res, 200, await credentialSync.list(syncMatch[1]));
+          if (req.method === 'POST' && syncMatch[2] === 'pairing') return json(res, 201, await credentialSync.createPairing(syncMatch[1], await readBody(req, 4096)));
+          if (req.method === 'POST' && syncMatch[2] === 'revoke') return json(res, 200, await credentialSync.revoke(syncMatch[1], await readBody(req, 4096)));
+          throw new GatewayError(404, 'not_found', 'Credential sync management endpoint not found.');
         }
         const match = path.match(/^\/v1\/accounts\/(acct-[a-f0-9]{20})\/(check|default|routing|reset-cooldown)$/);
         if (req.method === 'POST' && match) {
@@ -168,106 +203,28 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
       if (req.method === 'GET' && path === '/v1/models') return json(res, 200, { object: 'list', data: await catalog(requestUrl.searchParams.get('account_id') ?? undefined) });
       if (req.method !== 'POST' || path !== '/v1/chat/completions') throw new GatewayError(404, 'not_found', 'Endpoint not found.');
       if (!accepting) throw new GatewayError(503, 'shutting_down', 'Gateway is shutting down.');
-      const body = await readBody(req);
+      const body = await readBody(req, maxBodyBytes);
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new GatewayError(400, 'invalid_request', 'Expected a JSON object.');
-      let account = accountStore && (!accountRouter || body.account_id !== undefined || body.conversation_id !== undefined) ? await accountStore.resolve({ accountId: body.account_id, conversationId: body.conversation_id }) : null;
-      const input = validateRequest(body, (await (account ? modelsProvider(account.id) : catalog())).map(m => m.id));
-      if (outstanding >= maxQueue) throw new GatewayError(429, 'queue_full', 'The local Linear request queue is full.');
-      outstanding++;
-      controller = new AbortController();
-      controllers.add(controller);
-      timer = setTimeout(() => controller.abort(new GatewayError(504, 'linear_timeout', 'Linear reply timed out.')), timeoutMs);
-      req.once('aborted', () => controller.abort(new GatewayError(499, 'client_disconnected', 'Client disconnected.')));
-      res.once('close', () => { if (!res.writableEnded) controller.abort(new GatewayError(499, 'client_disconnected', 'Client disconnected.')); });
-      const task = chain.then(async () => {
-        controller.signal.throwIfAborted();
-        if (clientKey) await clientKeys.begin(clientKey.id);
-        let completed = false;
-        try {
-          const plan = accountRouter ? await accountRouter.plan(input) : { accounts: [account], strategy: 'fixed', failover_enabled: false };
-          const attempted = [];
-          const id = 'chatcmpl-' + randomUUID();
-          const created = Math.floor(Date.now() / 1000);
-          const routingInfo = () => ({ strategy: plan.strategy, attempt_count: attempted.length, failover_count: Math.max(0, attempted.length - 1), attempted_account_ids: [...attempted] });
-          let result, selection;
-          for (const candidate of plan.accounts) {
-            controller.signal.throwIfAborted();
-            account = accountRouter ? { ...await accountStore.get(candidate.id), needsConversationCheck: candidate.needsConversationCheck } : candidate;
-            attempted.push(account?.id ?? null);
-            let accepted = false;
-            try {
-              if (accountRouter) await accountRouter.recordAttempt(account, { advanceCursor: plan.strategy === 'round_robin' });
-              const client = clientFactory ? await clientFactory(account) : new LinearClient(account ? normalizeSession(account.session) : await loadSession(sessionFile), { pollMs });
-              if (account?.needsConversationCheck) {
-                let conversation;
-                try { conversation = (await client.call(READ_QUERY, { id: input.conversationId }, controller.signal)).aiConversation; }
-                catch (error) { if (error.code !== 'linear_upstream_error') throw error; }
-                if (!conversation) throw new GatewayError(409, 'conversation_account_unknown', 'Cannot access this conversation with the selected account. Choose its original account or start a new conversation.');
-              }
-              selection = { requested_model: input.requestedModel === MODEL ? null : input.requestedModel, model_selection_verified: false, requested_reasoning_effort: input.reasoningEffort ?? null, reasoning_effort_verified: false, account_id: account?.id ?? null, ...(accountRouter ? { routing: routingInfo() } : {}), ...(input.compatibility ? { compatibility: input.compatibility } : {}) };
-              result = await client.chat(input, controller.signal, async conversationId => {
-                // Once Linear accepts a send, replay could duplicate its native tool actions.
-                accepted = true;
-                if (account) await accountStore.pin(conversationId, account.id);
-                controller.signal.throwIfAborted();
-                res.setHeader('x-linear-conversation-id', conversationId);
-                res.setHeader('x-linear-requested-model', input.requestedModel);
-                res.setHeader('x-linear-requested-reasoning-effort', input.reasoningEffort ?? 'auto');
-                if (input.compatibility) res.setHeader('x-linear-client-tools', 'unavailable; text-only');
-                if (account) res.setHeader('x-linear-account-id', account.id);
-                if (accountRouter) {
-                  res.setHeader('x-linear-attempts', String(attempted.length));
-                  res.setHeader('x-linear-routing-strategy', plan.strategy);
-                }
-                if (input.stream) {
-                  res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no' });
-                  res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }) + '\n\n');
-                  heartbeat = setInterval(() => { if (!res.destroyed) res.write(': waiting for Linear\n\n'); }, 15000);
-                }
-              });
-              if (accountRouter) await accountRouter.recordSuccess(account).catch(() => onError({ code: 'routing_store_unavailable', status: 503 }));
-              break;
-            } catch (error) {
-              let recorded = true;
-              if (accountRouter) await accountRouter.recordFailure(account, error).catch(() => { recorded = false; onError({ code: 'routing_store_unavailable', status: 503 }); });
-              if (accountRouter && plan.failover_enabled && recorded && !accepted && canFailOver(error) && attempted.length < plan.accounts.length && !controller.signal.aborted) continue;
-              if (accountRouter && error instanceof GatewayError) error.routing = routingInfo();
-              throw error;
-            }
-          }
-          if (controller.signal.aborted || res.destroyed) return;
-          if (input.stream) {
-            const chunk = (delta, finish_reason) => ({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [{ index: 0, delta, finish_reason }] });
-            res.write('data: ' + JSON.stringify(chunk({ content: result.text }, null)) + '\n\n');
-            res.write('data: ' + JSON.stringify(chunk({}, 'stop')) + '\n\n');
-            if (input.includeUsage) res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: MODEL, ...selection, choices: [], usage: null }) + '\n\n');
-            res.end('data: [DONE]\n\n');
-          } else json(res, 200, { id, object: 'chat.completion', created, model: MODEL, ...selection, choices: [{ index: 0, message: { role: 'assistant', content: result.text }, finish_reason: 'stop' }], usage: null, conversation_id: result.conversationId });
-          completed = true;
-        } finally {
-          if (clientKey) await clientKeys.finish(clientKey.id, completed).catch(() => onError({ code: 'key_store_unavailable', status: 503 }));
-        }
-      });
-      chain = task.catch(() => {});
-      try { await task; } finally { outstanding--; }
+      await completions(req, res, { body, clientKey });
     } catch (cause) {
-      const error = controller?.signal.aborted ? controller.signal.reason : cause instanceof GatewayError ? cause : new GatewayError(500, 'internal_error', 'The local gateway could not complete the request.');
+      const error = cause instanceof GatewayError ? cause : new GatewayError(500, 'internal_error', 'The local gateway could not complete the request.');
       onError({ code: error.code ?? 'internal_error', status: error.status ?? 500 });
       if (!res.destroyed) {
         if (res.headersSent) res.end('data: ' + JSON.stringify(errorPayload(error)) + '\n\ndata: [DONE]\n\n');
         else { if (error.retryAfter) res.setHeader('retry-after', String(error.retryAfter)); json(res, error.status ?? 500, errorPayload(error)); }
       }
-    } finally {
-      clearTimeout(timer);
-      clearInterval(heartbeat);
-      if (controller) controllers.delete(controller);
     }
+    finally { requests.delete(completion); finish(); }
   });
+  server.scheduler = scheduler;
+  server.toolSessions = toolSessions;
   server.shutdown = async () => {
     accepting = false;
     for (const controller of controllers) controller.abort(new GatewayError(503, 'shutting_down', 'Gateway is shutting down.'));
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
+    await Promise.allSettled([...requests]);
+    await toolSessions?.flush?.();
   };
   return server;
 }

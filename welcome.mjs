@@ -28,7 +28,7 @@ export const WELCOME_HTML = String.raw`<!doctype html>
 <label for="prompt">消息</label><textarea id="prompt" placeholder="例如：请用一句话介绍你能做什么" required></textarea>
 <div class="actions"><span id="state" class="muted">准备就绪</span><button id="send" class="primary" type="submit">发送消息</button></div></form>
 </section></div>
-<footer>Compose 默认只映射宿主机本机端口。当前通过轮询获取完整回复；SSE 为缓冲输出。<a href="/health" target="_blank" rel="noopener">查看健康状态</a></footer>
+<footer>Compose 默认只映射宿主机本机端口。通过轮询读取 Linear 回复：SSE 只转发轮询时已稳定的文本，上游只在结束时给出回复则一次输出。客户端工具调用为实验性结构化适配。<a href="/health" target="_blank" rel="noopener">查看健康状态</a></footer>
 </main>
 <script>
 const $=id=>document.getElementById(id);let conversationId=null;let conversationAccountId=null;let busy=false;

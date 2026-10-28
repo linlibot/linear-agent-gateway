@@ -1,3 +1,10 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Linear 凭证提取</title><link rel="stylesheet" href="popup.css"></head>
-<body><main><div class="brand">LINEAR AGENT GATEWAY</div><h1>一键提取凭证</h1><p>在当前浏览器登录 Linear，进入目标工作区，再点击下方按钮。</p><div class="card"><strong id="target">正在读取当前标签页…</strong><p>提取会刷新当前页面。请先保存未提交的输入。</p><button id="capture" disabled>一键提取并下载 JSON</button><button id="download" hidden>下载已提取的 JSON</button><button id="cancel" class="secondary" hidden>取消并清除</button></div><p id="status" role="status" aria-live="polite"></p><div id="identity" hidden><div>用户 ID：<code id="user"></code></div><div>工作区 ID：<code id="organization"></code></div></div><p class="note">下载后，到网关的“账户管理 → 导入账户凭证”选择 JSON。添加其他账号时，切换 Linear 登录账号后重新提取。</p><p class="note">只在点击后读取当前标签页的请求；不发送聊天、不上传凭证。临时结果最多保留 5 分钟，导出后即清除。JSON 含登录 Cookie，请保存在自己可访问的位置。</p></main><script type="module" src="popup.mjs"></script></body></html>
+<body><main>
+<div class="brand">LINEAR AGENT GATEWAY</div><h1>凭证提取与自动刷新</h1><p>在当前浏览器登录 Linear，进入目标工作区。</p>
+<div class="card"><strong id="target">正在读取当前标签页…</strong><p>首次提取或配对会刷新当前页面。请先保存未提交的输入。</p><button id="capture" disabled>一键提取并下载 JSON</button><button id="download" hidden>下载已提取的 JSON</button><button id="cancel" class="secondary" hidden>取消并清除</button></div>
+<p id="status" role="status" aria-live="polite"></p><div id="identity" hidden><div>用户 ID：<code id="user"></code></div><div>工作区 ID：<code id="organization"></code></div></div>
+<section class="card"><h2>配对自动刷新</h2><p>先在网关导入账号，再点击该账号的“配对自动刷新”生成配对码。配对后，凭证只同步到你填写的网关。</p><label for="gateway">网关地址（不含 /v1）</label><input id="gateway" type="url" value="http://127.0.0.1:8089" autocomplete="off"><label for="pair-code">后台配对码</label><input id="pair-code" type="password" maxlength="68" autocomplete="off" placeholder="粘贴 10 分钟内有效的一次性配对码"><button id="pair" disabled>配对并启用自动刷新</button><p class="note">浏览器会请求连接该网关的权限。每 15 分钟在已打开的目标 Linear 标签页进行只读登录检查，不刷新页面、不发送聊天。需要浏览器和该工作区保持登录；重新登录仍由你完成。</p></section>
+<section class="card"><h2>已配对账号</h2><div id="bindings">正在读取…</div><button id="sync-now" class="secondary">立即检查已配对账号</button></section>
+<p class="note">手动导出的 JSON 是静态备份；自动刷新直接更新网关中的账号凭证。配对令牌保存在扩展本地存储，仅能更新对应账号，可在后台撤销；不保存管理员密码。未配对时不会向网关传送凭证。</p>
+</main><script type="module" src="popup.mjs"></script></body></html>

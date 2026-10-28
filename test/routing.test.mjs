@@ -13,7 +13,7 @@ import { ENDPOINT, GatewayError } from '../upstream.mjs';
 import { modelEntries } from '../models.mjs';
 
 const session = n => ({ endpoint: ENDPOINT, headers: { user: 'user-' + n, organization: 'org-' + n, cookie: 'TEST_COOKIE_' + n } });
-async function setup(t, { count = 3 } = {}) {
+async function setup(t, { count = 3, maxConcurrency = 1 } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'linear-routing-test-'));
   t.after(async () => {
     const resolved = path.resolve(directory);
@@ -31,7 +31,7 @@ async function setup(t, { count = 3 } = {}) {
   const router = new AccountRouter(store, { modelsProvider, now: () => clock });
   await router.initialize();
   const calls = [], failures = new Map(), acceptedFailures = new Map();
-  const server = createGateway({ apiKey: 'local-test', accountStore: store, accountRouter: router, modelsProvider, timeoutMs: 2000, clientFactory: account => ({
+  const server = createGateway({ apiKey: 'local-test', accountStore: store, accountRouter: router, modelsProvider, timeoutMs: 2000, maxConcurrency, clientFactory: account => ({
     call: async () => ({ aiConversation: { id: 'accessible' } }),
     chat: async (input, signal, onAccepted) => {
       calls.push({ account: account.id, input });

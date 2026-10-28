@@ -41,7 +41,7 @@ test('bare HTML source survives Markdown list parsing and nested code blocks wit
   assert.match(html, /\* \{box-sizing/);
   assert(!html.includes('```'));
   assert.doesNotThrow(() => new vm.Script(html.match(/<script>([\s\S]*?)<\/script>/)[1]));
-  const rendered = answerText([{ type: 'text', bodyData }]);
+  const rendered = answerText([{ type: 'text', metadata: { phase: 'answer' }, bodyData }]);
   assert.equal(rendered.match(/```/g).length, 2);
   assert.match(rendered, /^```html/);
   assert.equal(htmlDocumentSource(doc('Here is an HTML example: <html></html>')), null);
@@ -70,7 +70,10 @@ test('polling does not accept an old completed response or retry the send mutati
     return response({ aiConversation: { status: 'complete', parts: reads === 1 ? [part('old-turn', 'OLD')] : [part('old-turn', 'OLD'), part('new-turn', 'NEW')] } });
   } });
   const result = await client.chat({ text: 'hello', requestedModel: 'openai/gpt-6.1-sol' }, AbortSignal.timeout(2000));
-  assert.deepEqual(result, { text: 'NEW', conversationId: 'new-conversation' });
+  assert.equal(result.text, 'NEW');
+  assert.equal(result.conversationId, 'new-conversation');
+  assert.equal(result.assistantMessageId, 'new-turn');
+  assert.deepEqual(result.linearToolCalls, []);
   assert.equal(calls.filter(c => c.query.startsWith('mutation')).length, 1);
   assert.equal(calls[0].variables.input.model, 'openai/gpt-6.1-sol');
   assert.equal(reads, 2);
@@ -231,9 +234,11 @@ const cherryHtmlRequest = {
   stream_options: { include_usage: true },
 };
 
-test('Cherry optional tools allow direct HTML generation without pretending client tools were executed', () => {
+const legacyTools = { clientTools: 'off' };
+
+test('LINEAR_CLIENT_TOOLS=off keeps Cherry optional tools as a text-only request without pretending tools ran', () => {
   for (const choice of ['auto', 'none', undefined]) {
-    const input = validateRequest({ ...cherryHtmlRequest, tool_choice: choice });
+    const input = validateRequest({ ...cherryHtmlRequest, tool_choice: choice }, ['linear-agent'], legacyTools);
     assert.match(input.text, /鹈鹕骑自行车/);
     assert.match(input.text, /外部工具未连接/);
     assert(!input.text.includes('CLIENT_ONLY_TOOL_DESCRIPTION'));
@@ -241,21 +246,36 @@ test('Cherry optional tools allow direct HTML generation without pretending clie
     assert.equal(input.compatibility.client_tools, 'unavailable');
     assert.equal(input.compatibility.ignored_tool_definitions, 3);
   }
-  assert.equal(validateRequest({ ...valid, tool_choice: 'none' }).compatibility, undefined);
+  assert.equal(validateRequest({ ...valid, tool_choice: 'none' }, ['linear-agent'], legacyTools).compatibility, undefined);
 });
 
-test('required or named client tools and tool-result history remain explicit errors', () => {
+test('with client tools off, required or named tools and tool-result history remain explicit errors', () => {
+  const check = body => validateRequest(body, ['linear-agent'], legacyTools);
   for (const choice of ['required', { type: 'function', function: { name: 'fs_read' } }]) {
-    assert.throws(() => validateRequest({ ...valid, tools: cherryTools, tool_choice: choice }), e => e.status === 400 && e.code === 'client_tools_unavailable');
+    assert.throws(() => check({ ...valid, tools: cherryTools, tool_choice: choice }), e => e.status === 400 && e.code === 'client_tools_unavailable');
   }
+  assert.throws(() => check({ ...valid, tool_choice: 'invalid' }), e => e.code === 'invalid_tool_choice');
+  assert.throws(() => check({ ...valid, tools: 'not an array' }), e => e.code === 'invalid_tools');
+  assert.throws(() => check({ ...valid, tools: [{ type: 'function', function: {} }] }), e => e.code === 'invalid_tools');
+  assert.throws(() => check({ ...valid, messages: [{ role: 'tool', tool_call_id: 'call-1', content: 'result' }, ...valid.messages] }), e => e.code === 'unsupported_message');
+  assert.throws(() => check({ ...valid, messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'call-1' }] }, ...valid.messages] }), e => e.code === 'unsupported_message');
+});
+
+test('with client tools on (default), tool definitions, tool_choice and tool history are validated instead of ignored', () => {
+  const input = validateRequest({ ...valid, tools: cherryTools, tool_choice: 'required' });
+  assert.equal(input.mode, 'tools');
+  assert.equal(input.choice.mode, 'required');
+  assert.deepEqual(input.tools.map(t => t.name), ['fs_read', 'web_fetch', 'web_search']);
+  assert.equal(input.text, undefined);
   assert.throws(() => validateRequest({ ...valid, tool_choice: 'invalid' }), e => e.code === 'invalid_tool_choice');
   assert.throws(() => validateRequest({ ...valid, tools: 'not an array' }), e => e.code === 'invalid_tools');
   assert.throws(() => validateRequest({ ...valid, tools: [{ type: 'function', function: {} }] }), e => e.code === 'invalid_tools');
-  assert.throws(() => validateRequest({ ...valid, messages: [{ role: 'tool', tool_call_id: 'call-1', content: 'result' }, ...valid.messages] }), e => e.code === 'unsupported_message');
-  assert.throws(() => validateRequest({ ...valid, messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'call-1' }] }, ...valid.messages] }), e => e.code === 'unsupported_message');
+  assert.throws(() => validateRequest({ ...valid, tools: cherryTools, tool_choice: { type: 'function', function: { name: 'missing' } } }), e => e.code === 'invalid_tool_choice');
+  assert.throws(() => validateRequest({ ...valid, messages: [{ role: 'tool', tool_call_id: 'call-1', content: 'result' }, ...valid.messages] }), e => e.code === 'invalid_tool_messages');
+  assert.throws(() => validateRequest({ ...valid, messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'call-1' }] }, ...valid.messages] }), e => e.code === 'invalid_tool_messages');
 });
 
-test('Cherry request completes with valid SSE and exposes text-only compatibility metadata', () => withGateway(async ({ request, stats }) => {
+test('with client tools off, Cherry request completes with valid SSE and exposes text-only compatibility metadata', () => withGateway(async ({ request, stats }) => {
   const reply = await request(cherryHtmlRequest);
   assert.equal(reply.status, 200);
   assert.equal(reply.headers.get('x-linear-client-tools'), 'unavailable; text-only');
@@ -269,7 +289,7 @@ test('Cherry request completes with valid SSE and exposes text-only compatibilit
   const denied = await request({ ...cherryHtmlRequest, tool_choice: 'required' });
   assert.equal(denied.status, 400);
   assert.equal(stats().calls, 1);
-}));
+}, { chat: legacyTools }));
 
 test('JSON and Cherry SSE return the requested effort with no claim about the actual compute budget', () => withGateway(async ({ base, request, stats }) => {
   const reply = await request({ ...valid, reasoning_effort: 'high' });
@@ -289,4 +309,4 @@ test('JSON and Cherry SSE return the requested effort with no claim about the ac
   assert.deepEqual(catalog.data[0].supported_reasoning_efforts, ['auto', 'low', 'medium', 'high']);
   assert.equal(catalog.data[0].default_reasoning_effort, 'auto');
   assert.equal(catalog.object, 'list');
-}, { modelsProvider: async () => modelEntries() }));
+}, { modelsProvider: async () => modelEntries(), chat: legacyTools }));

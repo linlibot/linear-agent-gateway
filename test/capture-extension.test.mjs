@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import { CaptureController, capturedSession, ENDPOINT, isLinearPage } from '../browser-extension/capture.mjs';
 import { sessionFromCredentials } from '../accounts.mjs';
 import { captureExtensionArchive, crc32, EXTENSION_FILES } from '../capture-extension.mjs';
+import { BrowserSync, gatewayOrigin, gatewayPost, permissionOrigin, probeLinear } from '../browser-extension/sync.mjs';
 
 const request = (tabId = 7, extra = {}) => ({ tabId, method: 'POST', url: ENDPOINT, initiator: 'https://linear.app', requestHeaders: [
   { name: 'Cookie', value: 'linear=SYNTHETIC_CAPTURE_COOKIE' }, { name: 'User', value: 'fixture-user' }, { name: 'Organization', value: 'fixture-org' },
@@ -81,15 +82,15 @@ test('capture cancellation and expiry clear secrets and concurrent requests reta
 });
 
 test('extension worker accepts only its own popup messages and registers an observational request listener', async () => {
-  const f = fixture(), listeners = {};
+  const f = fixture(), listeners = {}; let bindings = [];
   const event = name => ({ addListener: (...args) => { listeners[name] = args; } });
-  const chrome = { runtime: { id: 'fixture-extension', getURL: name => 'chrome-extension://fixture-extension/' + name, onMessage: event('message') },
-    storage: { session: { get: async () => ({ capture: f.state() }), set: async ({ capture }) => f.controller.save(capture), remove: () => f.controller.clear() } },
-    alarms: { create: async () => {}, clear: async () => {}, onAlarm: event('alarm') },
+  const chrome = { runtime: { id: 'fixture-extension', getURL: name => 'chrome-extension://fixture-extension/' + name, onMessage: event('message'), onStartup: event('startup'), onInstalled: event('installed') },
+    storage: { session: { get: async () => ({ capture: f.state() }), set: async ({ capture }) => f.controller.save(capture), remove: () => f.controller.clear() }, local: { setAccessLevel: async () => {}, get: async () => ({ bindings }), set: async value => { bindings = value.bindings; } } },
+    alarms: { get: async () => null, create: async () => {}, clear: async () => {}, onAlarm: event('alarm') },
     tabs: { get: async id => tab(id), reload: async () => {}, onRemoved: event('removed') },
     webRequest: { onSendHeaders: event('request') } };
-  const source = (await fs.readFile(new URL('../browser-extension/background.mjs', import.meta.url), 'utf8')).replace(/^import[^\n]+\n/, '');
-  new vm.Script(source).runInNewContext({ chrome, CaptureController, ENDPOINT });
+  const source = (await fs.readFile(new URL('../browser-extension/background.mjs', import.meta.url), 'utf8')).replace(/^import[^\n]+\n/gm, '');
+  new vm.Script(source).runInNewContext({ chrome, CaptureController, ENDPOINT, BrowserSync, gatewayOrigin, gatewayPost, permissionOrigin, probeLinear });
   assert.deepEqual(Array.from(listeners.request[1].urls), [ENDPOINT]);
   assert.deepEqual(Array.from(listeners.request[2]), ['requestHeaders', 'extraHeaders']);
   const handler = listeners.message[0], sender = { id: 'fixture-extension', url: chrome.runtime.getURL('popup.html') };
@@ -117,9 +118,10 @@ test('downloaded ZIP contains exactly the reviewed extension sources and limited
   const manifest = JSON.parse(entries.get('manifest.json'));
   assert.equal(manifest.manifest_version, 3);
   assert.deepEqual(manifest.host_permissions, ['https://linear.app/*', 'https://client-api.linear.app/*']);
-  assert.deepEqual(manifest.permissions, ['webRequest', 'storage', 'alarms']);
+  assert.deepEqual(manifest.permissions, ['webRequest', 'storage', 'alarms', 'scripting']);
+  assert.deepEqual(manifest.optional_host_permissions, ['http://*/*', 'https://*/*']);
   assert.equal(manifest.incognito, 'not_allowed');
   assert(!manifest.content_scripts); assert(!manifest.externally_connectable);
-  assert(manifest.content_security_policy.extension_pages.includes("connect-src 'none'"));
-  assert.doesNotThrow(() => new vm.Script(entries.get('popup.mjs').toString().replace(/^import[^\n]+\n/, '')));
+  assert(manifest.content_security_policy.extension_pages.includes('connect-src http: https:'));
+  assert.doesNotThrow(() => new vm.Script(entries.get('popup.mjs').toString().replace(/^import[^\n]+\n/gm, '')));
 });

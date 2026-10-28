@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 
-export const EXTENSION_FILES = ['manifest.json', 'capture.mjs', 'background.mjs', 'popup.html', 'popup.css', 'popup.mjs', 'README.txt'];
+export const EXTENSION_FILES = ['manifest.json', 'capture.mjs', 'sync.mjs', 'background.mjs', 'popup.html', 'popup.css', 'popup.mjs', 'README.txt'];
 const table = Array.from({ length: 256 }, (_, i) => {
   let value = i;
   for (let bit = 0; bit < 8; bit++) value = value & 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1;

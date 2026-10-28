@@ -10,11 +10,26 @@ import { fileURLToPath } from 'node:url';
 import { readConfig } from '../config.mjs';
 
 test('local startup keeps loopback and existing port and timeout defaults', () => {
-  assert.deepEqual(readConfig({}), { host: '127.0.0.1', port: 8089, pollMs: 1500, timeoutMs: 180000 });
+  const config = readConfig({});
+  assert.deepEqual({ host: config.host, port: config.port, pollMs: config.pollMs, timeoutMs: config.timeoutMs }, { host: '127.0.0.1', port: 8089, pollMs: 1500, timeoutMs: 180000 });
+  assert.deepEqual({ maxConcurrency: config.maxConcurrency, accountConcurrency: config.accountConcurrency, maxQueue: config.maxQueue }, { maxConcurrency: 4, accountConcurrency: 1, maxQueue: 8 });
+  assert.deepEqual(config.chat, { clientTools: 'structured', streamMode: 'incremental', toolContinuation: 'native', promptFormat: 'rich', toolRepairAttempts: 1, strictParameters: false, maxPromptChars: 1000000 });
+  assert.deepEqual(config.toolSessions, { ttlSeconds: 86400, idempotencySeconds: 300 });
+});
+
+test('tool, streaming and concurrency settings are validated', () => {
+  const config = readConfig({ LINEAR_CLIENT_TOOLS: 'off', LINEAR_STREAM_MODE: 'buffered', LINEAR_TOOL_CONTINUATION: 'replay', LINEAR_PROMPT_FORMAT: 'plain', LINEAR_TOOL_REPAIR_ATTEMPTS: '0', LINEAR_STRICT_PARAMETERS: '1', LINEAR_MAX_CONCURRENCY: '2', LINEAR_ACCOUNT_CONCURRENCY: '2', LINEAR_MAX_QUEUE: '20', LINEAR_IDEMPOTENCY_SECONDS: '0' });
+  assert.deepEqual(config.chat, { clientTools: 'off', streamMode: 'buffered', toolContinuation: 'replay', promptFormat: 'plain', toolRepairAttempts: 0, strictParameters: true, maxPromptChars: 1000000 });
+  assert.equal(config.maxConcurrency, 2);
+  assert.equal(config.toolSessions.idempotencySeconds, 0);
+  for (const env of [{ LINEAR_CLIENT_TOOLS: 'yes' }, { LINEAR_STREAM_MODE: 'fast' }, { LINEAR_MAX_CONCURRENCY: '0' }, { LINEAR_ACCOUNT_CONCURRENCY: '99' }, { LINEAR_TOOL_REPAIR_ATTEMPTS: '9' }, { LINEAR_MAX_BODY_BYTES: '10' }]) {
+    assert.throws(() => readConfig(env), /Invalid LINEAR_/);
+  }
 });
 
 test('container and IPv6 listen addresses can be explicitly configured', () => {
-  assert.deepEqual(readConfig({ LINEAR_HOST: '0.0.0.0', LINEAR_PORT: '8090', LINEAR_POLL_MS: '500', LINEAR_TIMEOUT_MS: '1000' }), { host: '0.0.0.0', port: 8090, pollMs: 500, timeoutMs: 1000 });
+  const { host, port, pollMs, timeoutMs } = readConfig({ LINEAR_HOST: '0.0.0.0', LINEAR_PORT: '8090', LINEAR_POLL_MS: '500', LINEAR_TIMEOUT_MS: '1000' });
+  assert.deepEqual({ host, port, pollMs, timeoutMs }, { host: '0.0.0.0', port: 8090, pollMs: 500, timeoutMs: 1000 });
   assert.equal(readConfig({ LINEAR_HOST: '::1' }).host, '::1');
 });
 

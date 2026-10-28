@@ -1,7 +1,12 @@
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { GatewayError } from './errors.mjs';
+import { textDoc } from './rich-doc.mjs';
+import { normalizeMessages } from './messages.mjs';
+import { normalizeToolChoice, normalizeTools } from './tool-protocol.mjs';
 
+export { GatewayError };
 export const MODEL = 'linear-agent';
 export const REASONING_EFFORTS = ['auto', 'low', 'medium', 'high'];
 export const ENDPOINT = 'https://client-api.linear.app/graphql';
@@ -20,17 +25,26 @@ export const READ_QUERY = `query LinearAgentRead($id: String!) {
     }
   }
 }`;
+// Fields below are taken from Linear's published GraphQL schema (AiConversationTextPart.body,
+// AiConversationPartMetadata.startedAt/endedAt, AiConversationBaseToolCall.name). If the
+// client API rejects them, the client falls back to READ_QUERY for the rest of the process.
+export const READ_QUERY_EXTENDED = `query LinearAgentReadDetailed($id: String!) {
+  aiConversation(id: $id) {
+    id status parts {
+      __typename
+      ... on AiConversationBasePart { id type metadata { phase turnId startedAt endedAt } }
+      ... on AiConversationTextPart { body bodyData }
+      ... on AiConversationErrorPart { message }
+      ... on AiConversationToolCallPart { toolCall { __typename ... on AiConversationBaseToolCall { name } } }
+    }
+  }
+}`;
 const CANCEL_QUERY = `mutation AiConversationCancel($id: String!) {
   aiConversationCancel(id: $id) { success aiConversation { id } }
 }`;
-
-export class GatewayError extends Error {
-  constructor(status, code, message) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
-}
+const EMPTY_COMPLETE_POLLS = 3;
+let detailedReadSupported = true;
+export const detailedReadState = { get supported() { return detailedReadSupported; }, reset() { detailedReadSupported = true; } };
 
 export async function loadSession(path) {
   let session;
@@ -116,16 +130,39 @@ export function htmlDocumentSource(doc) {
   return /<\/html>\s*$/i.test(html) ? html : null;
 }
 
-export function answerText(parts) {
-  return parts.filter(p => p.type === 'text' && p.metadata?.phase !== 'commentary').map(p => {
-    const html = htmlDocumentSource(p.bodyData);
-    if (!html) return richText(p.bodyData);
-    const fence = '`'.repeat(Math.max(3, ...[...html.matchAll(/`+/g)].map(m => m[0].length + 1)));
-    return `${fence}html\n${html}\n${fence}`;
-  }).filter(Boolean).join('\n\n');
+export function startsLikeHtmlDocument(doc) {
+  return doc?.type === 'doc' && doc.content?.[0]?.type === 'paragraph' && /^(?:<!doctype html\b|<html\b)/i.test(richText(doc.content[0]).trimStart());
 }
 
-function clientToolOptions(body) {
+/** Visible answer parts of a turn: text parts outside the commentary phase. Reasoning is never included. */
+export function answerParts(parts) {
+  return parts.filter(p => p.type === 'text' && p.metadata?.phase === 'answer');
+}
+
+export function renderAnswerPart(p) {
+  const html = htmlDocumentSource(p.bodyData);
+  if (!html) return richText(p.bodyData);
+  const fence = '`'.repeat(Math.max(3, ...[...html.matchAll(/`+/g)].map(m => m[0].length + 1)));
+  return `${fence}html\n${html}\n${fence}`;
+}
+
+export function answerText(parts) {
+  return answerParts(parts).map(renderAnswerPart).filter(Boolean).join('\n\n');
+}
+
+/** Markdown bodies of the answer parts when the upstream provides them (detailed read). */
+export function answerMarkdown(parts) {
+  const answer = answerParts(parts);
+  if (!answer.length || !answer.every(p => typeof p.body === 'string')) return null;
+  return answer.map(p => p.body).filter(Boolean).join('\n\n');
+}
+
+/** Names of Linear's own built-in tool calls in a turn. Arguments and results are not exposed. */
+export function linearToolCalls(parts) {
+  return parts.filter(p => p.type === 'toolCall').map(p => p.toolCall?.name ?? 'unknown');
+}
+
+function legacyToolOptions(body) {
   if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.length > 128)) throw new GatewayError(400, 'invalid_tools', 'tools must be an array of at most 128 function definitions.');
   const tools = body.tools ?? [];
   for (const tool of tools) {
@@ -133,41 +170,63 @@ function clientToolOptions(body) {
   }
   const choice = body.tool_choice ?? 'auto';
   if (choice !== 'auto' && choice !== 'none') {
-    if (choice === 'required' || (choice && typeof choice === 'object' && !Array.isArray(choice) && choice.type === 'function' && typeof choice.function?.name === 'string')) throw new GatewayError(400, 'client_tools_unavailable', 'Required client tool calls are not supported. Use tool_choice auto/none for a text reply, or disable tools/MCP in Cherry. Linear built-in tools are separate.');
+    if (choice === 'required' || (choice && typeof choice === 'object' && !Array.isArray(choice) && choice.type === 'function' && typeof choice.function?.name === 'string')) throw new GatewayError(400, 'client_tools_unavailable', 'Required client tool calls are not supported while LINEAR_CLIENT_TOOLS=off. Use tool_choice auto/none for a text reply, or enable client tools on the gateway. Linear built-in tools are separate.');
     throw new GatewayError(400, 'invalid_tool_choice', 'tool_choice must be auto or none for text-only compatibility.');
   }
   if (!tools.length) return null;
   return { client_tools: 'unavailable', ignored_tool_definitions: tools.length, tool_choice: choice };
 }
 
-export function validateRequest(body, allowedModels = [MODEL]) {
+const CORE_PARAMETERS = new Set(['model', 'messages', 'stream', 'stream_options', 'conversation_id', 'account_id', 'tools', 'tool_choice', 'reasoning_effort', 'parallel_tool_calls']);
+// Accepted for client compatibility but not forwarded: Linear's agent API has no sampling or
+// length controls. They are reported back in `ignored_parameters`, never silently applied.
+export const IGNORED_PARAMETERS = ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'presence_penalty', 'frequency_penalty', 'seed', 'stop', 'user', 'metadata', 'store', 'logit_bias', 'n', 'logprobs', 'top_logprobs', 'service_tier', 'prompt_cache_key', 'safety_identifier', 'verbosity', 'modalities', 'response_format', 'prediction'];
+
+function checkIgnored(body, strict) {
+  const ignored = [];
+  for (const key of Object.keys(body)) {
+    if (CORE_PARAMETERS.has(key)) continue;
+    if (!IGNORED_PARAMETERS.includes(key) || strict) throw new GatewayError(400, 'unsupported_parameter', `Parameter ${key} is not supported by Linear Agent chat.`);
+    const value = body[key];
+    if (value === null || value === undefined) continue;
+    if (key === 'n' && value !== 1) throw new GatewayError(400, 'unsupported_parameter', 'Only n=1 is supported.');
+    if (key === 'logprobs' && value !== false) throw new GatewayError(400, 'unsupported_parameter', 'logprobs are not available from Linear.');
+    if (key === 'modalities' && !(Array.isArray(value) && value.every(v => v === 'text'))) throw new GatewayError(400, 'unsupported_parameter', 'Only text output is supported.');
+    if (key === 'response_format' && value?.type !== 'text') throw new GatewayError(400, 'unsupported_parameter', 'Only response_format {"type":"text"} is supported; JSON modes are not available from Linear.');
+    ignored.push(key);
+  }
+  return ignored;
+}
+
+export function validateRequest(body, allowedModels = [MODEL], { clientTools = 'structured', strictParameters = false } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new GatewayError(400, 'invalid_request', 'Expected a JSON object.');
-  const allowed = new Set(['model', 'messages', 'stream', 'stream_options', 'conversation_id', 'account_id', 'tools', 'tool_choice', 'reasoning_effort']);
-  for (const key of Object.keys(body)) if (!allowed.has(key)) throw new GatewayError(400, 'unsupported_parameter', `Parameter ${key} is not supported by Linear Agent chat.`);
+  const ignoredParameters = checkIgnored(body, strictParameters);
   if (typeof body.model !== 'string' || !allowedModels.includes(body.model)) throw new GatewayError(400, 'unsupported_model', 'Choose a model from /v1/models. Only the default entry and locally tested model parameters are enabled.');
   const effort = body.reasoning_effort ?? 'auto';
   if (!REASONING_EFFORTS.includes(effort)) throw new GatewayError(400, 'invalid_reasoning_effort', 'reasoning_effort must be auto, low, medium or high. Omit it or use auto to keep the Linear default.');
   if (body.account_id !== undefined && (typeof body.account_id !== 'string' || !/^acct-[a-f0-9]{20}$/.test(body.account_id))) throw new GatewayError(400, 'invalid_account', 'account_id must be an ID returned by /v1/accounts.');
   if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new GatewayError(400, 'invalid_request', 'stream must be a boolean.');
-  if (body.stream_options !== undefined && (!body.stream || !body.stream_options || typeof body.stream_options !== 'object' || Array.isArray(body.stream_options) || Object.keys(body.stream_options).some(k => k !== 'include_usage') || (body.stream_options.include_usage !== undefined && typeof body.stream_options.include_usage !== 'boolean'))) throw new GatewayError(400, 'invalid_request', 'stream_options supports only include_usage with stream=true. Token usage is unavailable.');
-  const compatibility = clientToolOptions(body);
-  const messages = body.messages;
-  if (!Array.isArray(messages) || !messages.length) throw new GatewayError(400, 'invalid_messages', 'messages must be a non-empty array.');
-  const normalized = messages.map(m => {
-    if (!m || !['system', 'developer', 'user', 'assistant'].includes(m.role) || m.tool_calls || m.function_call) throw new GatewayError(400, 'unsupported_message', 'Only text system/developer/user/assistant messages are supported.');
-    let content = m.content;
-    if (Array.isArray(content) && content.every(p => p?.type === 'text' && typeof p.text === 'string')) content = content.map(p => p.text).join('\n');
-    if (typeof content !== 'string') throw new GatewayError(400, 'unsupported_content', 'Only text content is supported.');
-    return { role: m.role, content };
-  });
-  if (normalized.at(-1).role !== 'user' || !normalized.at(-1).content.trim()) throw new GatewayError(400, 'invalid_messages', 'The final message must contain user text.');
-  if (body.conversation_id !== undefined) {
-    if (typeof body.conversation_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.conversation_id)) throw new GatewayError(400, 'invalid_conversation', 'conversation_id must be a UUID.');
-    if (normalized.length !== 1) throw new GatewayError(400, 'invalid_messages', 'When continuing conversation_id, send only the new user message.');
+  if (body.stream_options !== undefined && body.stream_options !== null && (!body.stream || typeof body.stream_options !== 'object' || Array.isArray(body.stream_options) || Object.keys(body.stream_options).some(k => k !== 'include_usage' && k !== 'include_obfuscation') || (body.stream_options.include_usage !== undefined && typeof body.stream_options.include_usage !== 'boolean'))) throw new GatewayError(400, 'invalid_request', 'stream_options supports only include_usage with stream=true. Token usage is unavailable.');
+  if (body.parallel_tool_calls !== undefined && body.parallel_tool_calls !== null && typeof body.parallel_tool_calls !== 'boolean') throw new GatewayError(400, 'invalid_request', 'parallel_tool_calls must be a boolean.');
+  if (body.conversation_id !== undefined && (typeof body.conversation_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.conversation_id))) throw new GatewayError(400, 'invalid_conversation', 'conversation_id must be a UUID.');
+  const common = { requestedModel: body.model, accountId: body.account_id, conversationId: body.conversation_id, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true, ignoredParameters, ...(effort === 'auto' ? {} : { reasoningEffort: effort }) };
+  const legacy = clientTools === 'off';
+  const compatibility = legacy ? legacyToolOptions(body) : null;
+  const tools = legacy ? [] : normalizeTools(body.tools);
+  const choice = legacy ? null : normalizeToolChoice(body.tool_choice, tools);
+  const { messages, hasToolHistory } = normalizeMessages(body.messages, { allowTools: !legacy });
+  if (!legacy && (tools.length || hasToolHistory)) {
+    if (body.conversation_id !== undefined) {
+      const [first] = messages;
+      const delta = (messages.length === 1 && first.role === 'user') || (first.role === 'assistant' && first.toolCalls.length && messages.slice(1).every(m => m.role === 'tool' || m.role === 'user'));
+      if (!delta) throw new GatewayError(400, 'invalid_messages', 'When continuing conversation_id with tools, send only the new user message, or the assistant tool_calls message followed by its tool results.');
+    }
+    return { mode: 'tools', ...common, messages, tools, choice, parallelToolCalls: body.parallel_tool_calls !== false, hasToolHistory };
   }
-  const history = normalized.length === 1 ? normalized[0].content : '以下是调用方提供的对话历史，请根据这些内容回复最后一条用户消息。\n\n' + normalized.map(m => `[${m.role}]\n${m.content}`).join('\n\n');
+  if (body.conversation_id !== undefined && messages.length !== 1) throw new GatewayError(400, 'invalid_messages', 'When continuing conversation_id, send only the new user message.');
+  const history = messages.length === 1 ? messages[0].content : '以下是调用方提供的对话历史，请根据这些内容回复最后一条用户消息。\n\n' + messages.map(m => `[${m.role}]\n${m.content ?? ''}`).join('\n\n');
   const text = compatibility ? '本次客户端只接收最终文本回复；客户端提供的外部工具未连接，无法调用它们。对代码生成任务，请在回复中直接给出完整代码。\n\n' + history : history;
-  return { text, requestedModel: body.model, accountId: body.account_id, conversationId: body.conversation_id, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true, ...(effort === 'auto' ? {} : { reasoningEffort: effort }), ...(compatibility ? { compatibility } : {}) };
+  return { mode: 'chat', text, ...common, ...(compatibility ? { compatibility } : {}) };
 }
 
 export class LinearClient {
@@ -188,26 +247,45 @@ export class LinearClient {
     try { result = await response.json(); }
     catch { throw new GatewayError(502, 'linear_invalid_response', 'Linear returned a non-JSON response.'); }
     if (!response.ok || result.errors?.length) {
+      if (result.data?.aiConversationSendMessage) throw new GatewayError(502, 'linear_send_uncertain', 'Linear returned an ambiguous send result. The request will not be replayed.');
       const auth = [401, 403].includes(response.status) || result.errors?.some(e => /AUTHENTICATION|UNAUTHENTICATED/.test(e.extensions?.code ?? ''));
       if (auth) throw new GatewayError(503, 'linear_session_expired', 'Linear authentication failed. Refresh the local login session.');
       if (response.status === 429) throw new GatewayError(429, 'linear_rate_limit', 'Linear rate limit reached. Please wait before trying again.');
-      throw new GatewayError(502, 'linear_upstream_error', 'Linear rejected the chat request.');
+      if (result.errors?.some(e => e.extensions?.code === 'GRAPHQL_VALIDATION_FAILED' || /^(Cannot query field|Unknown type|Unknown fragment|Fragment cannot be spread)/.test(e.message ?? ''))) throw new GatewayError(502, 'linear_query_unsupported', 'Linear does not accept this query shape.');
+      // Input validation errors mean the operation did not run; callers may adjust and resend.
+      const invalidInput = Boolean(result.errors?.length && result.errors.every(e => e.extensions?.code === 'BAD_USER_INPUT' && !e.path && /^Variable "\$input" got invalid value/.test(e.message ?? '')));
+      throw Object.assign(new GatewayError(502, 'linear_upstream_error', 'Linear rejected the chat request.'), { invalidInput });
     }
     if (!result.data) throw new GatewayError(502, 'linear_invalid_response', 'Linear returned no data.');
     return result.data;
   }
-  async chat({ text, conversationId, requestedModel = MODEL, reasoningEffort }, signal, onAccepted = () => {}) {
+  async read(id, signal) {
+    if (detailedReadSupported) {
+      try { return (await this.call(READ_QUERY_EXTENDED, { id }, signal)).aiConversation; }
+      catch (error) { if (error.code !== 'linear_query_unsupported') throw error; detailedReadSupported = false; }
+    }
+    return (await this.call(READ_QUERY, { id }, signal)).aiConversation;
+  }
+  async cancel(id) {
+    await this.call(CANCEL_QUERY, { id }, AbortSignal.timeout(5000)).catch(() => {});
+  }
+  /**
+   * Sends one user message and polls until the assistant turn completes.
+   * `doc` (a Linear rich-text document) takes precedence over `text`.
+   * `onProgress({ parts, status })` sees every poll of the current turn.
+   */
+  async chat({ text, doc, conversationId, requestedModel = MODEL, reasoningEffort }, signal, onAccepted = () => {}, onProgress) {
     const proposedId = conversationId ?? randomUUID();
-    const data = await this.call(SEND_QUERY, { input: { conversationId: proposedId, userMessageId: randomUUID(), context: [], bodyData: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] }, resume: true, ...(requestedModel === MODEL ? {} : { model: requestedModel }), ...(reasoningEffort ? { reasoningEffort } : {}) } }, signal);
+    const data = await this.call(SEND_QUERY, { input: { conversationId: proposedId, userMessageId: randomUUID(), context: [], bodyData: doc ?? textDoc(text), resume: true, ...(requestedModel === MODEL ? {} : { model: requestedModel }), ...(reasoningEffort ? { reasoningEffort } : {}) } }, signal);
     const sent = data.aiConversationSendMessage;
     if (!sent?.success || !sent.aiConversation?.id || !sent.assistantMessage?.id) throw new GatewayError(502, 'linear_send_failed', 'Linear did not confirm the message.');
     const id = sent.aiConversation.id;
-    let complete = false;
+    let complete = false, emptyCompletePolls = 0;
     try {
       await onAccepted(id);
       for (;;) {
         signal?.throwIfAborted();
-        const { aiConversation: conversation } = await this.call(READ_QUERY, { id }, signal);
+        const conversation = await this.read(id, signal);
         if (!conversation) throw new GatewayError(502, 'linear_conversation_missing', 'Linear did not return the conversation.');
         const parts = currentTurnParts(conversation, sent.assistantMessage.id);
         if (parts.some(p => p.type === 'error') || ['error', 'cancelled', 'canceled'].includes(conversation.status)) {
@@ -215,17 +293,20 @@ export class LinearClient {
           throw new GatewayError(502, 'linear_agent_error', 'Linear Agent could not complete the reply.');
         }
         if (parts.some(p => p.type === 'elicitation') || !['complete', 'active', 'pending'].includes(conversation.status)) {
-          throw new GatewayError(409, 'linear_action_required', 'Linear requires an action in its conversation page.');
+          throw new GatewayError(409, 'linear_action_required', 'Linear requires an action in its conversation page (a confirmation for one of its own built-in tools). Client tools are separate.');
         }
         const text = answerText(parts);
-        if (conversation.status === 'complete' && text) {
+        if (conversation.status === 'complete' && !text) emptyCompletePolls++;
+        const done = conversation.status === 'complete' && (text || emptyCompletePolls >= EMPTY_COMPLETE_POLLS);
+        if (onProgress) await onProgress({ parts, status: conversation.status, complete: Boolean(done) });
+        if (done) {
           complete = true;
-          return { text, conversationId: id };
+          return { text, conversationId: id, assistantMessageId: sent.assistantMessage.id, markdown: answerMarkdown(parts), parts: answerParts(parts), linearToolCalls: linearToolCalls(parts) };
         }
         await sleep(this.pollMs, undefined, { signal });
       }
     } finally {
-      if (!complete) await this.call(CANCEL_QUERY, { id }, AbortSignal.timeout(5000)).catch(() => {});
+      if (!complete) await this.cancel(id);
     }
   }
 }

@@ -139,6 +139,22 @@ export class AccountStore {
       return this.list();
     });
   }
+  async refresh(id, source) {
+    const before = await this.get(id), session = sessionFromCredentials(source);
+    if (accountIdFor(session) !== id) throw new GatewayError(409, 'sync_identity_mismatch', 'This credential belongs to a different account or workspace.');
+    const client = new LinearClient(normalizeSession(session), { fetchImpl: this.fetchImpl });
+    const data = await client.call(CHECK_QUERY, {}, AbortSignal.timeout(20000));
+    if (data.viewer?.id !== session.headers.user || data.organization?.id !== session.headers.organization) throw new GatewayError(409, 'sync_identity_mismatch', 'Linear did not confirm the bound account identity.');
+    return this.write(async () => {
+      const state = await this.state(), current = state.accounts.find(a => a.id === id);
+      if (!current || current.updatedAt !== before.updatedAt) throw new GatewayError(409, 'sync_credential_changed', 'Credentials changed during validation; retry with the current browser session.');
+      current.session = session;
+      current.updatedAt = new Date(Math.max(Date.now(), (Date.parse(before.updatedAt) || 0) + 1)).toISOString();
+      current.lastCheck = { status: 'valid', checkedAt: now(), code: null, userName: data.viewer.name, workspaceName: data.organization.name };
+      await writeJson(this.accountsFile, state);
+      return this.publicAccount(current, state.defaultAccountId);
+    });
+  }
   async check(id) {
     const account = await this.get(id);
     let lastCheck;

@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Linear 凭证提取 · Local Gateway",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minimum_chrome_version": "102",
-  "description": "点击后从当前已登录的 Linear 页面提取网关所需凭证，下载为本机 JSON。不会上传凭证或发送聊天。",
-  "permissions": ["webRequest", "storage", "alarms"],
+  "description": "提取 Linear 登录凭证；与自有网关配对后自动同步更新，并定期做只读登录检查。不会发送 Agent 消息。",
+  "permissions": ["webRequest", "storage", "alarms", "scripting"],
   "host_permissions": ["https://linear.app/*", "https://client-api.linear.app/*"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.mjs", "type": "module" },
   "action": { "default_popup": "popup.html", "default_title": "提取当前 Linear 账户凭证" },
   "incognito": "not_allowed",
-  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'none'" }
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'; connect-src http: https:" }
 }
