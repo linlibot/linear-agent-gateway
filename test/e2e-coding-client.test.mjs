@@ -85,12 +85,13 @@ test('E2E: the same task works when every request replays the full transcript', 
   assert.equal(upstream.conversationCount, 5);
 });
 
-test('E2E: write code and tests, run them locally, patch the bug from the failing output, rerun', async t => {
+test('E2E: create JS and Python files, run JS tests, patch the failure and rerun', async t => {
   const dir = await workspace(t);
   const plan = [
     () => ({ calls: [
       { name: 'write_file', arguments: { path: 'sum.js', content: 'export const sum = (a, b) => a - b;\n' } },
       { name: 'write_file', arguments: { path: 'sum.test.js', content: "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { sum } from './sum.js';\ntest('adds', () => assert.equal(sum(2, 3), 5));\n" } },
+      { name: 'write_file', arguments: { path: 'sum.py', content: 'def add(a, b):\n    return a + b\n' } },
     ] }),
     () => ({ calls: [{ name: 'run_command', arguments: { command: 'node --test sum.test.js' } }] }),
     last => { assert.match(last, /exit code [1-9]/); return { intro: 'The test fails; sum subtracts. Patching.', calls: [{ name: 'replace_in_file', arguments: { path: 'sum.js', old_text: 'a - b', new_text: 'a + b' } }] }; },
@@ -102,7 +103,8 @@ test('E2E: write code and tests, run them locally, patch the bug from the failin
   const result = await runCodingTask({ base, key: 'test-key', workspace: dir, task: 'Write sum.js with a test, run it and fix any failure.', approve: async (name, args) => { approvals.push(name); return true; } });
   assert.equal(result.final, 'Fixed sum.js (a - b → a + b); node --test now passes.');
   assert.equal(await fs.readFile(path.join(dir, 'sum.js'), 'utf8'), 'export const sum = (a, b) => a + b;\n');
-  assert.deepEqual(approvals, ['write_file', 'write_file', 'run_command', 'replace_in_file', 'run_command'], 'every local action went through the client approval hook');
+  assert.equal(await fs.readFile(path.join(dir, 'sum.py'), 'utf8'), 'def add(a, b):\n    return a + b\n');
+  assert.deepEqual(approvals, ['write_file', 'write_file', 'write_file', 'run_command', 'replace_in_file', 'run_command'], 'every local action went through the client approval hook');
   assert.equal(upstream.conversationCount, 1);
 });
 
