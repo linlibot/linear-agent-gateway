@@ -25,6 +25,7 @@ jobs:
           printf 'build-canary' > .private/build-canary.txt
           printf 'CONTAINER_BUILD_CANARY=1\n' > .env
           printf 'build-canary' > credential-canary.har
+          printf 'build-canary' > browser-extension/credential-canary.json
       - name: Validate Compose
         run: docker compose config --quiet
       - name: Build image and run unit tests

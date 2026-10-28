@@ -7,6 +7,7 @@ import { ACCOUNTS_HTML } from './accounts-page.mjs';
 import { canFailOver } from './routing.mjs';
 import { KEYS_HTML } from './keys-page.mjs';
 import { LOGIN_HTML, SETUP_HTML, SECURITY_HTML } from './admin-pages.mjs';
+import { captureExtensionArchive } from './capture-extension.mjs';
 
 export async function ensureAccess(runtimeDir) {
   await fs.mkdir(runtimeDir, { recursive: true });
@@ -62,7 +63,7 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
       const requestUrl = new URL(req.url, 'http://localhost');
       const path = requestUrl.pathname;
       if (req.method === 'GET' && path === '/health') return json(res, 200, { status: 'ok', service: 'linear-agent-gateway', model: MODEL });
-      if (adminAuth && req.method === 'GET' && ['/login', '/setup', '/admin', '/admin/security', '/accounts', '/keys'].includes(path)) {
+      if (adminAuth && req.method === 'GET' && ['/login', '/setup', '/admin', '/admin/security', '/accounts', '/keys', '/admin/capture-extension.zip'].includes(path)) {
         const configured = await adminAuth.configured(), session = await adminAuth.session(req);
         if (!configured) return path === '/setup' ? html(res, SETUP_HTML) : redirect(res, '/setup');
         if (path === '/setup') return redirect(res, session ? '/keys' : '/login');
@@ -73,6 +74,11 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
         }
         if (!session) return redirect(res, '/login?next=' + encodeURIComponent(path === '/admin' ? '/keys' : path));
         if (path === '/admin') return redirect(res, '/keys');
+        if (path === '/admin/capture-extension.zip') {
+          const archive = await captureExtensionArchive();
+          res.writeHead(200, { 'content-type': 'application/zip', 'content-disposition': 'attachment; filename="linear-credential-capture.zip"', 'content-length': archive.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' });
+          return res.end(archive);
+        }
         return html(res, path === '/keys' ? KEYS_HTML : path === '/accounts' ? ACCOUNTS_HTML : SECURITY_HTML);
       }
       if (adminAuth && path.startsWith('/auth/')) {

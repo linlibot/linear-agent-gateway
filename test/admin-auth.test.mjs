@@ -59,7 +59,7 @@ async function fixture(t, { publicOrigin } = {}) {
 
 test('uninitialized and anonymous users cannot load backend pages or bypass management with the old key', async t => {
   const f = await fixture(t);
-  for (const route of ['/keys', '/accounts', '/admin/security']) {
+  for (const route of ['/keys', '/accounts', '/admin/security', '/admin/capture-extension.zip']) {
     const response = await f.request(route);
     assert.equal(response.status, 303); assert.equal(response.headers.get('location'), '/setup');
   }
@@ -92,6 +92,9 @@ test('login rotates cookies and a password session can manage the gateway while 
   assert.notEqual(session.cookie, initial.cookie);
   assert.notEqual(session.csrf, initial.csrf);
   assert.equal((await f.request('/keys', session)).status, 200);
+  const extension = await f.request('/admin/capture-extension.zip', session);
+  assert.equal(extension.status, 200); assert.equal(extension.headers.get('content-type'), 'application/zip');
+  assert.equal(Buffer.from(await extension.arrayBuffer()).readUInt32LE(0), 0x04034b50);
   const profile = await (await f.request('/auth/session', session)).json();
   assert.equal(profile.username, 'Admin'); assert.equal(profile.authenticated, true); assert.equal(profile.csrf_token, session.csrf);
   assert(!JSON.stringify(profile).includes('digest'));

@@ -5,6 +5,12 @@
 !test/*.mjs
 !scripts/
 !scripts/*.mjs
+!browser-extension/
+!browser-extension/manifest.json
+!browser-extension/*.mjs
+!browser-extension/popup.html
+!browser-extension/popup.css
+!browser-extension/README.txt
 .git/
 .local-runtime/
 outputs/

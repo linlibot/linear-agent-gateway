@@ -3,6 +3,7 @@ WORKDIR /app
 COPY package.json *.mjs ./
 COPY test/ ./test/
 COPY scripts/*.mjs ./scripts/
+COPY browser-extension/ ./browser-extension/
 RUN npm test
 
 FROM node:24-alpine
@@ -12,6 +13,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY --from=tested --chown=node:node /app/package.json /app/*.mjs ./
 COPY --from=tested --chown=node:node /app/scripts/ ./scripts/
+COPY --from=tested --chown=node:node /app/browser-extension/ ./browser-extension/
 RUN mkdir -p /app/.local-runtime /app/outputs \
     && chown node:node /app/.local-runtime /app/outputs
 USER node

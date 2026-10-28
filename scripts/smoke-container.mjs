@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 // Only run against the disposable, empty-account volume created by CI.
 assert.equal(process.env.LINEAR_CONTAINER_TEST, '1', 'This test requires an explicitly disposable container.');
 assert(process.getuid?.() > 0, 'The container must run without root.');
-for (const path of ['../.local-runtime/build-canary.txt', '../outputs/build-canary.txt', '../.private/build-canary.txt', '../.env', '../credential-canary.har', '../.git']) {
+for (const path of ['../.local-runtime/build-canary.txt', '../outputs/build-canary.txt', '../.private/build-canary.txt', '../.env', '../credential-canary.har', '../browser-extension/credential-canary.json', '../.git']) {
   await assert.rejects(fs.access(new URL(path, import.meta.url)), { code: 'ENOENT' });
 }
 const runtime = new URL('../.local-runtime/', import.meta.url);
@@ -34,6 +34,9 @@ async function manage(path, body, csrf = profile.csrf_token) {
 }
 assert.equal((await manage('/keys')).status, 200);
 assert.equal((await manage('/accounts')).status, 200);
+const extension = await manage('/admin/capture-extension.zip');
+assert.equal(extension.status, 200); assert.equal(extension.headers.get('content-type'), 'application/zip');
+assert.equal(Buffer.from(await extension.arrayBuffer()).readUInt32LE(0), 0x04034b50);
 assert.equal((await manage('/v1/routing', { max_attempts: 2 }, 'forged-csrf')).status, 403);
 assert.equal((await manage('/v1/chat/completions', { model: 'linear-agent', messages: [{ role: 'user', content: '你好' }] })).status, 401, 'A password cookie must not authorize chat calls.');
 const accounts = await (await manage('/v1/accounts')).json();

@@ -233,6 +233,20 @@ docker compose up -d
 
 打开 [本地账户管理](http://127.0.0.1:8089/accounts)，用管理员账号密码登录，然后导入每个账户的 HAR 或会话 JSON，可以分别命名为“个人账户”“工作账户”。管理员密码用于登录后台；Linear 登录凭证用于网关向 Linear 鉴权，两者不能互换。页面不持久保存管理员密码，也不会读取浏览器其他账户的 Cookie。
 
+0.9.0 提供 **Chrome / Edge 一键提取扩展**，免去导出 HAR 或手工复制字段：
+
+1. 登录账户后台，点击“下载 Chrome / Edge 提取扩展”，解压 ZIP。也可以直接使用仓库的 `browser-extension` 目录。
+2. Chrome 打开 `chrome://extensions`，Edge 打开 `edge://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，选择包含 `manifest.json` 的目录。首次安装后可将扩展固定到工具栏。[Chrome 官方安装说明](https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#load-unpacked)
+3. 在安装扩展的浏览器中登录 Linear，进入目标工作区。保存未提交的输入后，打开扩展，点击“一键提取并下载 JSON”。扩展会刷新当前标签页，等待包含完整身份字段的请求；无需发送 Agent 消息。若没有捕获，可在目标工作区打开任一页面，90 秒后仍无结果则重新提取。
+4. 捕获后生成 `linear-session-日期.json`。若弹窗关闭，5 分钟内重新打开扩展下载。回到账户后台，选择 JSON 并点击“导入并校验”。
+5. 添加其他账号时，在浏览器切换 Linear 登录账号后重新提取；其他工作区也需分别提取。扩展不支持隐身窗口。
+
+扩展只在点击后捕获选定标签页的一条完整请求，不拼接不同请求中的账户身份。仅申请 `webRequest`、`storage`、`alarms` 及 `linear.app` / `client-api.linear.app` 两个站点权限；通过只读的 `onSendHeaders` 与 `extraHeaders` 读取该请求实际发送的 Cookie（[Chrome 官方 API](https://developer.chrome.com/docs/extensions/reference/api/webRequest)），不读取其他站点、聊天内容或浏览历史，不修改请求、不自动发送聊天，也不上传凭证或直接访问网关。
+
+临时凭证保存在扩展的 `storage.session` 内存存储中（[Chrome 官方说明](https://developer.chrome.com/docs/extensions/reference/api/storage#storage_areas)）；导出、取消或关闭选定标签页时清除，结果生成 5 分钟后过期清除。JSON 文件包含实际登录 Cookie，应保存在自己可访问的位置。扩展安装包只有固定清单内的静态源码，不包含网关运行目录、账号或密钥。后台下载接口 `/admin/capture-extension.zip` 同样要求管理员登录。
+
+如果不安装扩展，仍可使用 HAR 或会话 JSON：
+
 每个账户分别登录 Linear，打开 Agent；按 F12 → Network，清空记录，发送一句简单消息，再导出包含此次请求及 Cookie 的 HAR。Chrome 默认脱敏 HAR 不包含 Cookie：在开发者工具 Settings → Preferences → Network 启用 `Allow to generate HAR with sensitive data`，再选择 `Export HAR (with sensitive data)`。[Chrome 官方说明](https://developer.chrome.com/docs/devtools/network/reference/#save-as-har)
 
 导入后自动读取 Linear 身份并显示校验结果。不同用户或工作区单独保存；同一用户、同一工作区再次导入只更新该账户。管理员在同一浏览器登录后，对话页点击“刷新账户”可手动选择；未登录的普通调用 Key 使用已配置的账号池自动选号。默认账户用于固定策略的首选账户；轮转策略按账户顺序分配新对话。
@@ -292,6 +306,6 @@ node --preserve-symlinks --preserve-symlinks-main .\scripts\smoke-test.mjs
 
 可设置 `LINEAR_TEST_MODEL=openai/gpt-6.1-sol` 让 smoke test 验证指定模型参数；`LINEAR_TEST_EFFORT=high` 验证指定强度及 JSON、原生续聊、SSE 的档位标识。真实测试均可用 `LINEAR_ACCOUNT_ID=acct-…` 指定账户；未指定时，候选模型探测使用默认账户，smoke test 的新对话遵循当前选号策略，续聊固定原账户。模型列表按账户读取 `.local-runtime/model-validations/{account_id}.json`，不存在或读取失败时仅开放默认入口；原模型报告只迁移到原账户。
 
-2026-10-28 验证：64 项本地测试通过，覆盖多账户导入、凭证校验、存储恢复、模型证据隔离、默认账户切换、续聊绑定、鉴权、取消、SSE、Cherry 自动附带工具的 HTML 生成请求、强度参数透传，以及三账户轮转、换号重试、冷却恢复、凭证刷新、策略持久化和已接受请求不重放。0.6.0 新增监听配置校验、无凭证首次启动及重启后密钥和策略保留测试。0.7.0 新增自建调用 Key、权限隔离、摘要存储、按 Key 计数、停用排队请求及统计故障不重放测试。0.8.0 新增管理员初始化与登录、旧 Key 无法绕过、密码及会话摘要、CSRF 和来源校验、退出与改密撤销、失败限流、重启持久化、认证文件损坏拒绝访问、HTTPS Cookie 和命令行密码会话测试。多账户轮转与故障转移使用独立临时目录中的模拟账户验证。真实聊天记录保存在本机 `.local-runtime/live-validation.json`，强度原始测试位于 `.local-runtime/reasoning-validation.json`；轮转上线验证记录见 `.local-runtime/routing-live-validation.json`。Docker 的实际构建、启动与重建测试结果见 [Docker 工作流](https://github.com/linlibot/linear-agent-gateway/actions/workflows/docker.yml)。
+2026-10-28 验证：71 项本地测试通过，覆盖多账户导入、凭证校验、存储恢复、模型证据隔离、默认账户切换、续聊绑定、鉴权、取消、SSE、Cherry 自动附带工具的 HTML 生成请求、强度参数透传，以及三账户轮转、换号重试、冷却恢复、凭证刷新、策略持久化和已接受请求不重放。0.6.0 新增监听配置校验、无凭证首次启动及重启后密钥和策略保留测试。0.7.0 新增自建调用 Key、权限隔离、摘要存储、按 Key 计数、停用排队请求及统计故障不重放测试。0.8.0 新增管理员初始化与登录、旧 Key 无法绕过、密码及会话摘要、CSRF 和来源校验、退出与改密撤销、失败限流、重启持久化、认证文件损坏拒绝访问、HTTPS Cookie 和命令行密码会话测试。0.9.0 新增凭证提取、跨标签页和账户隔离、过期清除、worker 恢复、弹窗来源校验及扩展 ZIP 的测试，使用模拟 Chrome API；尚未完成安装扩展后的真实 Linear 捕获验证。多账户轮转与故障转移使用独立临时目录中的模拟账户验证。真实聊天记录保存在本机 `.local-runtime/live-validation.json`，强度原始测试位于 `.local-runtime/reasoning-validation.json`；轮转上线验证记录见 `.local-runtime/routing-live-validation.json`。Docker 的实际构建、启动与重建测试结果见 [Docker 工作流](https://github.com/linlibot/linear-agent-gateway/actions/workflows/docker.yml)。
 
 Cherry 提示 `Parameter tools is not supported` 时，升级至 0.3.1 并重启网关即可兼容普通文本 / HTML 代码生成，不需要删除自动附带的工具定义。这个兼容处理不会启用 Cherry 的文件读取、联网搜索或 MCP；需要这些外部工具时，应使用支持完整工具往返的后端。HTML 代码可以在 Cherry 中复制或预览，不会自动写入本机文件。
