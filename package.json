@@ -1,12 +1,12 @@
 {
   "name": "linear-agent-gateway",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node --preserve-symlinks --preserve-symlinks-main server.mjs",
-    "test": "node --preserve-symlinks --preserve-symlinks-main --test test/gateway.test.mjs test/accounts.test.mjs test/routing.test.mjs test/config.test.mjs test/client-keys.test.mjs",
+    "test": "node --preserve-symlinks --preserve-symlinks-main --test test/gateway.test.mjs test/accounts.test.mjs test/routing.test.mjs test/config.test.mjs test/client-keys.test.mjs test/admin-auth.test.mjs",
     "test:models": "node --preserve-symlinks --preserve-symlinks-main scripts/test-models.mjs"
   }
 }

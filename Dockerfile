@@ -2,6 +2,7 @@ FROM node:24-alpine AS tested
 WORKDIR /app
 COPY package.json *.mjs ./
 COPY test/ ./test/
+COPY scripts/*.mjs ./scripts/
 RUN npm test
 
 FROM node:24-alpine
@@ -10,7 +11,7 @@ ENV NODE_ENV=production \
     LINEAR_PORT=8089
 WORKDIR /app
 COPY --from=tested --chown=node:node /app/package.json /app/*.mjs ./
-COPY --chown=node:node scripts/*.mjs ./scripts/
+COPY --from=tested --chown=node:node /app/scripts/ ./scripts/
 RUN mkdir -p /app/.local-runtime /app/outputs \
     && chown node:node /app/.local-runtime /app/outputs
 USER node

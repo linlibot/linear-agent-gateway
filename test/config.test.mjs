@@ -54,7 +54,7 @@ test('fresh server boots without credentials and preserves its key and routing p
   async function start() {
     child = spawn(process.execPath, ['--preserve-symlinks', '--preserve-symlinks-main', path.join(directory, 'server.mjs')], {
       cwd: directory, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, LINEAR_HOST: '127.0.0.1', LINEAR_PORT: String(port), LINEAR_POLL_MS: '500', LINEAR_TIMEOUT_MS: '1000', LINEAR_SESSION_FILE: path.join(directory, 'absent-session.json') }
+      env: { ...process.env, LINEAR_HOST: '127.0.0.1', LINEAR_PORT: String(port), LINEAR_POLL_MS: '500', LINEAR_TIMEOUT_MS: '1000', LINEAR_PUBLIC_URL: '', LINEAR_SESSION_FILE: path.join(directory, 'absent-session.json') }
     });
     await new Promise((resolve, reject) => {
       let output = '', errorOutput = '';
@@ -74,7 +74,10 @@ test('fresh server boots without credentials and preserves its key and routing p
   assert.equal((await fetch(base + '/v1/accounts')).status, 401);
   const accessFile = path.join(directory, '.local-runtime', 'access.json');
   const { api_key: key } = JSON.parse(await fs.readFile(accessFile, 'utf8'));
-  const headers = { authorization: 'Bearer ' + key, 'content-type': 'application/json' };
+  assert.equal((await fetch(base + '/v1/accounts', { headers: { authorization: 'Bearer ' + key } })).status, 401);
+  const initialized = await fetch(base + '/auth/setup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bootstrap_key: key, username: 'fixture-admin', password: 'Synthetic startup passphrase!' }) });
+  assert.equal(initialized.status, 200);
+  const headers = { cookie: initialized.headers.get('set-cookie').split(';')[0], 'x-csrf-token': (await initialized.json()).csrf_token, 'content-type': 'application/json' };
   assert.equal((await (await fetch(base + '/v1/accounts', { headers })).json()).data.length, 0);
   const policy = { strategy: 'fixed', cooldown_seconds: 24 };
   assert.equal((await fetch(base + '/v1/routing', { method: 'POST', headers, body: JSON.stringify(policy) })).status, 200);

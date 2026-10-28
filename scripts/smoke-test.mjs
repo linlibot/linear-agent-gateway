@@ -1,8 +1,10 @@
 import fs from 'node:fs/promises';
 import assert from 'node:assert/strict';
+import { openAdminSession } from './admin-session.mjs';
+import { readConfig } from '../config.mjs';
 
 const { api_key } = JSON.parse(await fs.readFile(new URL('../.local-runtime/access.json', import.meta.url), 'utf8'));
-const base = `http://127.0.0.1:${process.env.LINEAR_PORT ?? 8089}`;
+const base = `http://127.0.0.1:${readConfig().port}`;
 const selectedModel = process.env.LINEAR_TEST_MODEL ?? 'linear-agent';
 const selectedEffort = process.env.LINEAR_TEST_EFFORT ?? 'auto';
 async function read(path) {
@@ -10,7 +12,14 @@ async function read(path) {
   assert.equal(response.status, 200);
   return response.json();
 }
-const [accounts, routing, models] = await Promise.all([read('/v1/accounts'), read('/v1/routing'), read('/v1/models')]);
+const admin = await openAdminSession(base);
+let accounts, routing;
+try {
+  [accounts, routing] = await Promise.all(['/v1/accounts', '/v1/routing'].map(async route => {
+    const response = await admin.request(route); assert.equal(response.status, 200); return response.json();
+  }));
+} finally { await admin.close(); }
+const models = await read('/v1/models');
 const knownAccounts = new Set(accounts.data.map(a => a.id));
 async function request(body) {
   if (selectedEffort !== 'auto') body.reasoning_effort = selectedEffort;

@@ -6,6 +6,7 @@ import { WELCOME_HTML } from './welcome.mjs';
 import { ACCOUNTS_HTML } from './accounts-page.mjs';
 import { canFailOver } from './routing.mjs';
 import { KEYS_HTML } from './keys-page.mjs';
+import { LOGIN_HTML, SETUP_HTML, SECURITY_HTML } from './admin-pages.mjs';
 
 export async function ensureAccess(runtimeDir) {
   await fs.mkdir(runtimeDir, { recursive: true });
@@ -23,9 +24,14 @@ export async function ensureAccess(runtimeDir) {
 }
 
 function json(res, status, value) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' });
   res.end(JSON.stringify(value));
 }
+function html(res, body) {
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" });
+  res.end(body);
+}
+function redirect(res, location) { res.writeHead(303, { location, 'cache-control': 'no-store' }); res.end(); }
 function errorPayload(error) {
   return { error: { message: error.message, type: error.status < 500 ? 'invalid_request_error' : 'api_error', code: error.code }, ...(error.routing ? { routing: error.routing } : {}) };
 }
@@ -41,7 +47,7 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   catch { throw new GatewayError(400, 'invalid_json', 'Request body is not valid JSON.'); }
 }
 
-export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
+export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, adminAuth, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
   let chain = Promise.resolve();
   let outstanding = 0;
   let accepting = true;
@@ -56,17 +62,56 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
       const requestUrl = new URL(req.url, 'http://localhost');
       const path = requestUrl.pathname;
       if (req.method === 'GET' && path === '/health') return json(res, 200, { status: 'ok', service: 'linear-agent-gateway', model: MODEL });
+      if (adminAuth && req.method === 'GET' && ['/login', '/setup', '/admin', '/admin/security', '/accounts', '/keys'].includes(path)) {
+        const configured = await adminAuth.configured(), session = await adminAuth.session(req);
+        if (!configured) return path === '/setup' ? html(res, SETUP_HTML) : redirect(res, '/setup');
+        if (path === '/setup') return redirect(res, session ? '/keys' : '/login');
+        if (path === '/login') {
+          if (!session) return html(res, LOGIN_HTML);
+          const next = requestUrl.searchParams.get('next');
+          return redirect(res, ['/keys', '/accounts', '/admin/security'].includes(next) ? next : '/keys');
+        }
+        if (!session) return redirect(res, '/login?next=' + encodeURIComponent(path === '/admin' ? '/keys' : path));
+        if (path === '/admin') return redirect(res, '/keys');
+        return html(res, path === '/keys' ? KEYS_HTML : path === '/accounts' ? ACCOUNTS_HTML : SECURITY_HTML);
+      }
+      if (adminAuth && path.startsWith('/auth/')) {
+        const session = await adminAuth.session(req);
+        if (req.method === 'GET' && path === '/auth/session') return json(res, 200, { configured: await adminAuth.configured(), authenticated: Boolean(session), ...(session ? { username: session.username, expires_at: session.expires_at, csrf_token: session.csrf_token } : {}) });
+        if (req.method === 'POST' && ['/auth/setup', '/auth/login', '/auth/logout', '/auth/password'].includes(path)) {
+          const needsSession = ['/auth/logout', '/auth/password'].includes(path);
+          if (needsSession && !session) throw new GatewayError(401, 'admin_login_required', 'Sign in with an administrator username and password first.');
+          adminAuth.assertMutation(req, needsSession ? session : null);
+          const body = await readBody(req, 8192), ip = req.socket.remoteAddress ?? 'unknown';
+          if (path === '/auth/setup' || path === '/auth/login') {
+            const result = path === '/auth/setup' ? await adminAuth.setup(body, ip) : await adminAuth.login(body, ip);
+            res.setHeader('set-cookie', adminAuth.cookie(result.token, req));
+            return json(res, 200, { authenticated: true, username: result.username, expires_at: result.expires_at, csrf_token: result.csrf_token });
+          }
+          if (path === '/auth/password') await adminAuth.changePassword(session, body, ip);
+          else await adminAuth.logout(session);
+          res.setHeader('set-cookie', adminAuth.cookie('', req, true));
+          return json(res, 200, { authenticated: false });
+        }
+        throw new GatewayError(404, 'not_found', 'Authentication endpoint not found.');
+      }
       if (req.method === 'GET' && ['/', '/v1', '/v1/', '/index.html', '/accounts', '/keys'].includes(path)) {
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" });
-        return res.end(path === '/accounts' ? ACCOUNTS_HTML : path === '/keys' ? KEYS_HTML : WELCOME_HTML);
+        return html(res, path === '/accounts' ? ACCOUNTS_HTML : path === '/keys' ? KEYS_HTML : WELCOME_HTML);
       }
       if (req.method === 'GET' && path === '/ui/models') return json(res, 200, { object: 'list', data: await catalog() });
       const authorization = req.headers.authorization ?? '';
       const key = Buffer.from(authorization);
       const administrator = key.length === expectedKey.length && timingSafeEqual(key, expectedKey);
-      const clientKey = !administrator && clientKeys && authorization.startsWith('Bearer ') ? await clientKeys.authenticate(authorization.slice(7)) : null;
-      if (!administrator && !clientKey) throw new GatewayError(401, 'invalid_api_key', 'A valid gateway Bearer API key is required.');
-      if (!administrator && (path.startsWith('/v1/accounts') || path === '/v1/routing' || path.startsWith('/v1/keys'))) throw new GatewayError(403, 'admin_key_required', 'Use the administrator key from access.json to manage accounts, routing or client keys.');
+      const management = path.startsWith('/v1/accounts') || path === '/v1/routing' || path.startsWith('/v1/keys');
+      const session = adminAuth && management ? await adminAuth.session(req) : null;
+      const clientKey = !administrator && !session && clientKeys && authorization.startsWith('Bearer ') ? await clientKeys.authenticate(authorization.slice(7)) : null;
+      if (adminAuth && management) {
+        if (!session) throw new GatewayError(clientKey ? 403 : 401, clientKey ? 'admin_key_required' : 'admin_login_required', 'Sign in with an administrator username and password to manage the gateway.');
+        if (!['GET', 'HEAD'].includes(req.method)) adminAuth.assertMutation(req, session);
+      } else {
+        if (!administrator && !clientKey) throw new GatewayError(401, 'invalid_api_key', 'A valid gateway Bearer API key is required.');
+        if (!administrator && management) throw new GatewayError(403, 'admin_key_required', 'Sign in with an administrator username and password to manage the gateway.');
+      }
       if (path.startsWith('/v1/keys')) {
         if (!clientKeys) throw new GatewayError(503, 'keys_unavailable', 'Client key management is not configured.');
         if (req.method === 'GET' && path === '/v1/keys') return json(res, 200, await clientKeys.list());
@@ -204,7 +249,7 @@ export function createGateway({ apiKey, sessionFile, accountStore, accountRouter
       onError({ code: error.code ?? 'internal_error', status: error.status ?? 500 });
       if (!res.destroyed) {
         if (res.headersSent) res.end('data: ' + JSON.stringify(errorPayload(error)) + '\n\ndata: [DONE]\n\n');
-        else json(res, error.status ?? 500, errorPayload(error));
+        else { if (error.retryAfter) res.setHeader('retry-after', String(error.retryAfter)); json(res, error.status ?? 500, errorPayload(error)); }
       }
     } finally {
       clearTimeout(timer);

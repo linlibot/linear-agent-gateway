@@ -19,7 +19,7 @@
 | API Key | 在 `/keys` 管理页自行创建的调用 Key |
 | 模型 | `linear-agent` |
 
-直接在浏览器打开 Base URL 会显示接入说明和对话测试页。测试页提供模型下拉框，需要手动输入调用 Key；网页不会自动读取或持久保存 Key。首次安装时，用 `.local-runtime/access.json` 中的管理员 Key 登录 `/keys` 页面，再创建自己的调用 Key。
+直接在浏览器打开 Base URL 会显示接入说明和对话测试页。测试页提供模型下拉框，需要手动输入调用 Key；网页不会自动读取或持久保存 Key。首次安装或从旧版本升级时，打开 [管理员登录](http://127.0.0.1:8089/login)，使用 `.local-runtime/access.json` 中的 `api_key` 作为初始化密钥，自行设置管理员账号密码，然后进入 `/keys` 创建调用 Key。
 
 截至 2026-10-27，以下模型参数在原有登录账户下均已完成独立发送和回复测试，收到有效回复，已加入该账户的 `/v1/models`。新导入的账户初始仅显示默认入口，需要单独测试候选参数：
 
@@ -49,7 +49,7 @@
 
 这些名称会原样传入上游 `AiConversationSendMessageInput.model`。测试只确认请求被接受并收到回复，尚未核验实际底层模型身份。因此响应中的 `model` 保留为 `linear-agent`，额外用 `requested_model` 标明请求参数，`model_selection_verified` 为 `false`。
 
-首次启动会生成独立的管理员 Key。本地启动默认只监听 `127.0.0.1`；Docker 容器内监听 `0.0.0.0`，Compose 默认仍只将端口映射到宿主机的 `127.0.0.1`。网关 Key 与 Linear 的会话 Cookie 分开存放；日志不输出 Cookie 或 Key。
+首次启动会生成独立的初始化密钥，不提供默认管理员账号密码。本地启动默认只监听 `127.0.0.1`；Docker 容器内监听 `0.0.0.0`，Compose 默认仍只将端口映射到宿主机的 `127.0.0.1`。管理员认证、调用 Key 与 Linear 的会话 Cookie 分开存放；日志不输出密码、Cookie 或 Key。
 
 ```powershell
 $linearClientKey = Read-Host '输入你创建的调用 Key'
@@ -63,15 +63,36 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8089/v1/chat/completions' `
     -Body ([Text.Encoding]::UTF8.GetBytes($linearBody))
 ```
 
-停止：`./scripts/stop-local.ps1`。可用环境变量：`LINEAR_HOST`（默认 `127.0.0.1`，须为 IPv4 或 IPv6 地址）、`LINEAR_PORT`（默认 8089）、`LINEAR_SESSION_FILE`（首次迁移使用的旧会话文件绝对路径）、`LINEAR_POLL_MS`（默认 1500，最小 500）、`LINEAR_TIMEOUT_MS`（默认 180000）。
+停止：`./scripts/stop-local.ps1`。可用环境变量：`LINEAR_HOST`（默认 `127.0.0.1`，须为 IPv4 或 IPv6 地址）、`LINEAR_PORT`（默认 8089）、`LINEAR_SESSION_FILE`（首次迁移使用的旧会话文件绝对路径）、`LINEAR_POLL_MS`（默认 1500，最小 500）、`LINEAR_TIMEOUT_MS`（默认 180000）、`LINEAR_PUBLIC_URL`（可选的浏览器访问源，例如 `https://gateway.example.com`，不含路径）。
+
+## 管理员账号密码
+
+0.8.0 起，`/accounts`、`/keys`、`/admin/security` 以及对应的管理 API 均要求管理员密码登录。未初始化时，后台跳转到 `/setup`；设置完成后，未登录访问会跳转到 `/login`。原 `access.json` 密钥无法绕过后台登录，已有调用 Key 可继续读取模型和发送聊天。
+
+首次设置需要初始化密钥，以免其他访客抢先注册管理员。在自己的电脑打开 `.local-runtime/access.json`，将其中的 `api_key` 填入初始化页面，再设置账号和密码。账号为 3–64 个字母、数字、中文、下划线、点或连字符，登录时不区分大小写；密码为 15–128 个字符，支持空格和 Unicode。初始化完成后，此密钥不能用于远程重置账号或密码。
+
+密码以带随机盐的 scrypt 摘要保存，参数为 `N=32768, r=8, p=3`；不保存明文密码。会话有效期为 8 小时，Cookie 使用 `HttpOnly`、`SameSite=Strict`，服务端仅保存会话摘要。退出登录立即撤销当前会话；在后台“修改密码”验证当前密码后，会撤销全部管理员会话，调用 Key 不受影响。密码长度与存储参数参考 [OWASP 身份认证](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html) 和 [密码存储建议](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)。
+
+管理写请求要求 JSON、同源检查及会话绑定的 `X-CSRF-Token`。每个直接连接来源 IP 在 15 分钟内累计 5 次认证失败后暂停尝试；不信任客户端提供的 `X-Forwarded-For`。反向代理后的请求会共享代理来源的失败计数。登录验证另有并发限制。CSRF 处理参考 [OWASP CSRF 建议](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)。
+
+程序管理接口使用相同登录流程：
+
+- `GET /auth/session`：读取初始化及登录状态；已登录时返回用户名、过期时间和 CSRF Token。
+- `POST /auth/setup`：仅首次接受 `{ "bootstrap_key": "初始化密钥", "username": "账号", "password": "密码" }`，设置成功后返回会话 Cookie 和 CSRF Token。
+- `POST /auth/login`：接受 `{ "username": "账号", "password": "密码" }`，成功后返回新的会话 Cookie 和 CSRF Token。
+- 管理 API 读取需携带该 Cookie；写入还需携带 `X-CSRF-Token` 请求头。所有管理 API 拒绝仅用 Bearer Key 鉴权。
+- `POST /auth/logout`：请求体 `{}`，撤销当前会话。
+- `POST /auth/password`：请求体 `{ "current_password": "当前密码", "new_password": "新密码" }`，更新密码并撤销所有会话。
+
+管理员 Cookie 只授权管理操作；模型及聊天接口仍要求调用 Key，不能仅凭浏览器登录态触发 Agent。管理员认证文件为 `.local-runtime/admin-auth.json`，损坏时后台拒绝访问，不会自动覆盖已有配置。忘记密码时需由拥有服务器文件权限的维护者停服，将该文件备份到受保护的位置后移出运行目录，再启动并用初始化密钥重新设置；这会清除原管理员会话，账号池及调用 Key 不变。
 
 ## 创建自己的 API Key
 
-0.7.0 起区分管理员 Key 和调用 Key：
+0.8.0 的凭证用途如下：
 
-1. **管理员 Key**：首次启动时自动生成，保存在 `.local-runtime/access.json` 的 `api_key`。用于管理账号、轮转策略和调用 Key。Docker 部署的读取命令见下节。
+1. **管理员账号密码**：首次通过初始化页面自行设置，用于管理账号池、轮转策略和调用 Key。`access.json` 中原称“管理员 Key”的密钥仅用于首次设置，并保留旧客户端聊天兼容；不能直接管理后台。Docker 初始化密钥的读取命令见下节。
 2. **调用 Key**：由你在 [调用 Key 管理](http://127.0.0.1:8089/keys) 页面创建。可以只填写名称，由网关生成随机 Key；也可以填写自己的 Key，长度为 32–256 个字母、数字、下划线或连字符。创建后将其填入 Cherry 等客户端的 API Key 栏。
-3. **Linear 登录凭证**：在账户管理页导入 HAR / 会话 JSON，供网关调用 Linear。它与前两种 Key 分开保存。
+3. **Linear 登录凭证**：在账户管理页导入 HAR / 会话 JSON，供网关调用 Linear。它与管理员密码、调用 Key 分开保存。
 
 调用路径为：`客户端调用 Key → 本地网关 → 已导入的 Linear 账号池 → Linear Agent`。调用 Key 使用账号池原有的权限和可用调用额度；新建更多 Key 不会增加上游额度，各 Key 也不对应独立的 Linear 余额。Linear 未返回可读取的剩余额度或 Token 用量，因此 `usage` 仍为 `null`，管理页不显示虚构的积分余额。
 
@@ -81,7 +102,7 @@ Key 原文只在创建响应中返回一次，列表和后续读取均不返回�
 
 统计中的“请求”是开始执行的有效聊天请求数，一次请求即使换号重试也只计一次；“成功”“失败”记录该请求的执行结果。模型列表读取、请求校验拒绝及未执行的排队请求不计数，这些数字不等于上游实际扣费、Token 或积分。旧管理员 Key 仍可用于聊天，以兼容已有客户端；它的请求不计入某把调用 Key 的统计。
 
-Key 管理 API 均需要管理员 Bearer Key：
+Key 管理 API 均需要管理员登录会话，写请求另需 CSRF Token：
 
 - `GET /v1/keys`：只返回名称、ID、启用状态和调用计数。
 - `POST /v1/keys`：请求体 `{ "name": "Cherry" }`，可另加 `"key": "自己填写的 Key"`；201 响应中的 `api_key` 是唯一一次返回原文。
@@ -100,7 +121,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-打开 [对话页](http://127.0.0.1:8089/v1) 或 [账户管理](http://127.0.0.1:8089/accounts)。首次启动会创建空账户存储和新的管理员 Key。下面的命令在你自己的终端显示管理员 Key，用它登录账户与调用 Key 管理页，再自行创建客户端使用的调用 Key：
+打开 [管理员登录](http://127.0.0.1:8089/login)。首次启动会创建空账户存储和新的初始化密钥。下面的命令在你自己的终端显示初始化密钥，用它完成首次管理员账号密码设置，再登录账户与调用 Key 管理页，自行创建客户端使用的调用 Key：
 
 ```sh
 docker compose exec gateway node -p "JSON.parse(require('node:fs').readFileSync('/app/.local-runtime/access.json','utf8')).api_key"
@@ -108,9 +129,9 @@ docker compose exec gateway node -p "JSON.parse(require('node:fs').readFileSync(
 
 通过账户管理页导入 HAR / 会话 JSON，即可添加账号。API Base URL 仍是 `http://127.0.0.1:8089/v1`。镜像不包含开发者账号、Cookie、本地密钥、HAR 或生成结果；全新数据卷的模型目录初始只有 `linear-agent`，导入账号后可在容器内运行 `docker compose exec gateway node scripts/test-models.mjs`，按该账号的真实测试结果开放其他模型。
 
-账户、管理员 Key、调用 Key 摘要及统计、模型成功记录、对话绑定、轮转策略和冷却状态全部保存在 `linear-data` 命名卷中，挂载到 `/app/.local-runtime`。更新、重启或执行 `docker compose down` 后重新启动均会保留这些数据。请勿给有用数据的 `down` 命令添加 `--volumes` / `-v`，该选项会删除数据卷。Docker 的健康检查验证本地服务是否响应，不代表 Linear 登录仍然有效。
+账户、初始化密钥、管理员密码及会话摘要、调用 Key 摘要及统计、模型成功记录、对话绑定、轮转策略和冷却状态全部保存在 `linear-data` 命名卷中，挂载到 `/app/.local-runtime`。更新、重启或执行 `docker compose down` 后重新启动均会保留这些数据。请勿给有用数据的 `down` 命令添加 `--volumes` / `-v`，该选项会删除数据卷。Docker 的健康检查验证本地服务是否响应，不代表 Linear 登录仍然有效。
 
-可将 `.env.example` 复制为 `.env`，修改宿主机端口、轮询间隔或总超时。例如 `LINEAR_PORT=8090` 会将宿主机 `8090` 映射到容器 `8089`；容器内部端口保持不变。如果本机已经运行旧网关，可改用其他宿主机端口，或先停止旧网关再使用 8089。
+可将 `.env.example` 复制为 `.env`，修改宿主机端口、轮询间隔或总超时。例如 `LINEAR_PORT=8090` 会将宿主机 `8090` 映射到容器 `8089`；容器内部端口保持不变。如果本机已经运行旧网关，可改用其他宿主机端口，或先停止旧网关再使用 8089。通过 HTTPS 反向代理访问时，将 `LINEAR_PUBLIC_URL` 设为实际浏览器访问源（例如 `https://gateway.example.com`）；网关会校验该 Origin，并为管理员 Cookie 设置 `Secure`，不依赖可伪造的转发头。直接本机或 SSH 转发访问时留空即可。
 
 服务器上部署时，默认端口仍只对服务器本机开放。可以通过 SSH 转发，在自己的电脑继续使用上述本地地址：
 
@@ -150,9 +171,9 @@ docker compose up -d
 
 - `GET /health`：本地进程健康检查，不验证上游会话是否仍有效。
 - `GET /v1` 或 `/`：浏览器接入说明与对话测试页，无需 Key 即可查看。
-- `GET /accounts`：账户导入、校验、默认账户及轮转策略管理页面；查看和修改账户时需要管理员 Key。
-- `GET /keys`：自行创建、命名、启停调用 Key 及查看调用计数，需要管理员 Key 读取和修改数据。
-- `GET /v1/models`：轮转策略下返回参与自动选号的账户已实测模型的并集；固定策略下返回默认账户的模型目录。可用 `?account_id=acct-…` 查询指定账户，需要调用 Key 或管理员 Key。暂时冷却或登录失效不会删除已保存的模型记录，发送时仍会跳过不可用账户。
+- `GET /accounts`：账户导入、校验、默认账户及轮转策略管理页面，要求管理员账号密码登录。
+- `GET /keys`：自行创建、命名、启停调用 Key 及查看调用计数，要求管理员账号密码登录。
+- `GET /v1/models`：轮转策略下返回参与自动选号的账户已实测模型的并集；固定策略下返回默认账户的模型目录。可用 `?account_id=acct-…` 查询指定账户，需要调用 Key（或兼容旧客户端的原密钥）。暂时冷却或登录失效不会删除已保存的模型记录，发送时仍会跳过不可用账户。
 - `POST /v1/chat/completions`：支持文本 JSON 响应及 `stream: true` 的 SSE 格式。
 - 未提供 `conversation_id` 时，新建 Linear 对话；多条 `messages` 会按角色转换为文本历史后发送。
 - JSON 响应带 `conversation_id`。后续携带它，并且只传一条新的 user 消息，即可原生续聊。SSE 响应通过 `X-Linear-Conversation-Id` 响应头返回对话 ID。
@@ -210,15 +231,17 @@ docker compose up -d
 
 ## 添加多个账户或更新凭证
 
-打开 [本地账户管理](http://127.0.0.1:8089/accounts)，填写 `.local-runtime/access.json` 中的 `api_key`，然后导入每个账户的 HAR 或会话 JSON，可以分别命名为“个人账户”“工作账户”。管理员 Key 用于管理网关；Linear 登录凭证用于网关向 Linear 鉴权，两者不能互换。页面不持久保存管理员 Key，也不会读取浏览器其他账户的 Cookie。
+打开 [本地账户管理](http://127.0.0.1:8089/accounts)，用管理员账号密码登录，然后导入每个账户的 HAR 或会话 JSON，可以分别命名为“个人账户”“工作账户”。管理员密码用于登录后台；Linear 登录凭证用于网关向 Linear 鉴权，两者不能互换。页面不持久保存管理员密码，也不会读取浏览器其他账户的 Cookie。
 
 每个账户分别登录 Linear，打开 Agent；按 F12 → Network，清空记录，发送一句简单消息，再导出包含此次请求及 Cookie 的 HAR。Chrome 默认脱敏 HAR 不包含 Cookie：在开发者工具 Settings → Preferences → Network 启用 `Allow to generate HAR with sensitive data`，再选择 `Export HAR (with sensitive data)`。[Chrome 官方说明](https://developer.chrome.com/docs/devtools/network/reference/#save-as-har)
 
-导入后自动读取 Linear 身份并显示校验结果。不同用户或工作区单独保存；同一用户、同一工作区再次导入只更新该账户。回到对话页填写管理员 Key，点击“刷新账户”可手动选择；普通调用 Key 使用已配置的账号池自动选号。默认账户用于固定策略的首选账户；轮转策略按账户顺序分配新对话。
+导入后自动读取 Linear 身份并显示校验结果。不同用户或工作区单独保存；同一用户、同一工作区再次导入只更新该账户。管理员在同一浏览器登录后，对话页点击“刷新账户”可手动选择；未登录的普通调用 Key 使用已配置的账号池自动选号。默认账户用于固定策略的首选账户；轮转策略按账户顺序分配新对话。
 
-也可在网关运行时使用命令行导入，第二个参数是可选名称：
+也可在网关运行时使用命令行导入。先在 `/login` 完成管理员设置，将密码放入仅自己可读的 UTF-8 文本文件（例如被 Git 忽略的 `.private/admin-password.txt`；末尾可带一个换行），再设置以下环境变量。脚本会登录、携带会话与 CSRF Token 导入，最后退出该会话。第二个参数是可选名称：
 
 ```powershell
+$env:LINEAR_ADMIN_USERNAME = '你设置的管理员账号'
+$env:LINEAR_ADMIN_PASSWORD_FILE = 'C:\受保护目录\admin-password.txt'
 node --preserve-symlinks --preserve-symlinks-main .\scripts\import-har.mjs 'C:\本地路径\linear.har' '工作账户'
 ```
 
@@ -226,7 +249,7 @@ node --preserve-symlinks --preserve-symlinks-main .\scripts\import-har.mjs 'C:\�
 
 账户文件是 `.local-runtime/accounts.json`，对话绑定是 `.local-runtime/conversation-accounts.json`。首次升级自动导入旧 `.local-runtime/linear-session.json`，原文件保留。账户管理 API 返回名称和身份等元信息，不返回 Cookie。所有会话文件、HAR 和本地 Key 都应留在本机；运行目录与根目录 `.private/` 已在 `.gitignore` 中排除。
 
-账户管理接口都需要管理员 Bearer Key：`GET /v1/accounts`；`POST /v1/accounts/import` 请求体 `{ "credential": "HAR 或会话 JSON 字符串", "label": "名称" }`；`POST /v1/accounts/{id}/check`；`POST /v1/accounts/{id}/default`。
+账户管理接口都需要管理员登录会话，写请求另需 CSRF Token：`GET /v1/accounts`；`POST /v1/accounts/import` 请求体 `{ "credential": "HAR 或会话 JSON 字符串", "label": "名称" }`；`POST /v1/accounts/{id}/check`；`POST /v1/accounts/{id}/default`。
 
 ## 轮转与换号重试
 
@@ -238,7 +261,7 @@ node --preserve-symlinks --preserve-symlinks-main .\scripts\import-har.mjs 'C:\�
 
 登录失效账户会暂停自动选号，更新凭证或成功执行“检查凭证”后恢复。限流账户冷却到期后自动恢复，也可点击“结束冷却”；结束冷却不能解除登录失效状态。多个账户属于不同工作区时，新对话会进入实际选中账户的工作区，已有对话不会迁移。全局请求队列仍然串行，轮转用于分摊账户使用。
 
-所有策略接口均需要管理员 Bearer Key：
+所有策略接口均需要管理员登录会话，写请求另需 CSRF Token：
 
 - `GET /v1/routing`：读取策略和各账户的状态、使用计数。
 - `POST /v1/routing`：更新下列策略字段，可只提交其中一部分；未知字段和超出范围的值会被拒绝。
@@ -263,11 +286,12 @@ npm test
 # 下面会依次真实测试候选模型参数，更新本机模型列表：
 npm run test:models
 # 下面会真实创建测试聊天，并验证原生续聊及缓冲 SSE：
+# 先按上节设置 LINEAR_ADMIN_USERNAME 和 LINEAR_ADMIN_PASSWORD_FILE。
 node --preserve-symlinks --preserve-symlinks-main .\scripts\smoke-test.mjs
 ```
 
 可设置 `LINEAR_TEST_MODEL=openai/gpt-6.1-sol` 让 smoke test 验证指定模型参数；`LINEAR_TEST_EFFORT=high` 验证指定强度及 JSON、原生续聊、SSE 的档位标识。真实测试均可用 `LINEAR_ACCOUNT_ID=acct-…` 指定账户；未指定时，候选模型探测使用默认账户，smoke test 的新对话遵循当前选号策略，续聊固定原账户。模型列表按账户读取 `.local-runtime/model-validations/{account_id}.json`，不存在或读取失败时仅开放默认入口；原模型报告只迁移到原账户。
 
-2026-10-27 验证：53 项本地测试通过，覆盖多账户导入、凭证校验、存储恢复、模型证据隔离、默认账户切换、续聊绑定、鉴权、取消、SSE、Cherry 自动附带工具的 HTML 生成请求、强度参数透传，以及三账户轮转、换号重试、冷却恢复、凭证刷新、策略持久化和已接受请求不重放。0.6.0 新增监听配置校验、无凭证首次启动及重启后密钥和策略保留测试。0.7.0 新增自建调用 Key、权限隔离、摘要存储、按 Key 计数、停用排队请求及统计故障不重放测试。多账户轮转与故障转移使用独立临时目录中的模拟账户验证。真实聊天记录保存在本机 `.local-runtime/live-validation.json`，强度原始测试位于 `.local-runtime/reasoning-validation.json`；轮转上线验证记录见 `.local-runtime/routing-live-validation.json`。Docker 的实际构建、启动与重建测试结果见 [Docker 工作流](https://github.com/linlibot/linear-agent-gateway/actions/workflows/docker.yml)。
+2026-10-28 验证：64 项本地测试通过，覆盖多账户导入、凭证校验、存储恢复、模型证据隔离、默认账户切换、续聊绑定、鉴权、取消、SSE、Cherry 自动附带工具的 HTML 生成请求、强度参数透传，以及三账户轮转、换号重试、冷却恢复、凭证刷新、策略持久化和已接受请求不重放。0.6.0 新增监听配置校验、无凭证首次启动及重启后密钥和策略保留测试。0.7.0 新增自建调用 Key、权限隔离、摘要存储、按 Key 计数、停用排队请求及统计故障不重放测试。0.8.0 新增管理员初始化与登录、旧 Key 无法绕过、密码及会话摘要、CSRF 和来源校验、退出与改密撤销、失败限流、重启持久化、认证文件损坏拒绝访问、HTTPS Cookie 和命令行密码会话测试。多账户轮转与故障转移使用独立临时目录中的模拟账户验证。真实聊天记录保存在本机 `.local-runtime/live-validation.json`，强度原始测试位于 `.local-runtime/reasoning-validation.json`；轮转上线验证记录见 `.local-runtime/routing-live-validation.json`。Docker 的实际构建、启动与重建测试结果见 [Docker 工作流](https://github.com/linlibot/linear-agent-gateway/actions/workflows/docker.yml)。
 
 Cherry 提示 `Parameter tools is not supported` 时，升级至 0.3.1 并重启网关即可兼容普通文本 / HTML 代码生成，不需要删除自动附带的工具定义。这个兼容处理不会启用 Cherry 的文件读取、联网搜索或 MCP；需要这些外部工具时，应使用支持完整工具往返的后端。HTML 代码可以在 Cherry 中复制或预览，不会自动写入本机文件。

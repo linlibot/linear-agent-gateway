@@ -6,6 +6,7 @@ import { loadModelEntries, modelEntries } from './models.mjs';
 import { AccountRouter } from './routing.mjs';
 import { readConfig } from './config.mjs';
 import { ClientKeyStore } from './client-keys.mjs';
+import { AdminAuth } from './admin-auth.mjs';
 
 const config = readConfig();
 const runtimeDir = new URL('./.local-runtime/', import.meta.url);
@@ -24,11 +25,14 @@ const accountRouter = new AccountRouter(accounts, { modelsProvider });
 await accountRouter.initialize();
 const clientKeys = new ClientKeyStore(runtimeDir, { adminKey: access.api_key });
 await clientKeys.initialize();
-const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, modelsProvider, pollMs: config.pollMs, timeoutMs: config.timeoutMs, onError: event => console.error(JSON.stringify(event)) });
+const adminAuth = new AdminAuth(runtimeDir, { bootstrapKey: access.api_key, publicOrigin: process.env.LINEAR_PUBLIC_URL });
+await adminAuth.initialize();
+const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, adminAuth, modelsProvider, pollMs: config.pollMs, timeoutMs: config.timeoutMs, onError: event => console.error(JSON.stringify(event)) });
 server.listen(config.port, config.host, () => {
   const address = config.host.includes(':') ? `[${config.host}]` : config.host;
   console.log(`Linear Agent gateway: http://${address}:${config.port}/v1`);
-  console.log(`Local API key file: ${fileURLToPath(new URL('access.json', runtimeDir))}`);
+  console.log(`Administrator setup/login: http://${address}:${config.port}/login`);
+  console.log(`Initialization key file: ${fileURLToPath(new URL('access.json', runtimeDir))}`);
 });
 server.on('error', error => { console.error(`Gateway startup failed: ${error.code ?? 'unknown'}`); process.exitCode = 1; });
 let stopping = false;

@@ -11,6 +11,7 @@ services:
       LINEAR_PORT: "8089"
       LINEAR_POLL_MS: "${LINEAR_POLL_MS:-1500}"
       LINEAR_TIMEOUT_MS: "${LINEAR_TIMEOUT_MS:-180000}"
+      LINEAR_PUBLIC_URL: "${LINEAR_PUBLIC_URL:-}"
     volumes:
       - linear-data:/app/.local-runtime
     stop_grace_period: 15s
