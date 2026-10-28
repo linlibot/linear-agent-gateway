@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 assert.equal(process.env.LINEAR_CONTAINER_TEST, '1', 'This test requires an explicitly disposable container.');
 assert(process.getuid?.() > 0, 'The container must run without root.');
 for (const path of ['../.local-runtime/build-canary.txt', '../outputs/build-canary.txt', '../.private/build-canary.txt', '../.env', '../credential-canary.har', '../browser-extension/credential-canary.json', '../.git']) {
-  await assert.rejects(fs.access(new URL(path, import.meta.url)), { code: 'ENOENT' });
+  await assert.rejects(fs.access(new URL(path, import.meta.url)), { code: 'ENOENT' }, 'Excluded source entered the image: ' + path);
 }
 const runtime = new URL('../.local-runtime/', import.meta.url);
 const { api_key: key } = JSON.parse(await fs.readFile(new URL('access.json', runtime), 'utf8'));

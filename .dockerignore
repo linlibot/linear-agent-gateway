@@ -6,8 +6,11 @@
 !scripts/
 !scripts/*.mjs
 !browser-extension/
+browser-extension/*
 !browser-extension/manifest.json
-!browser-extension/*.mjs
+!browser-extension/background.mjs
+!browser-extension/capture.mjs
+!browser-extension/popup.mjs
 !browser-extension/popup.html
 !browser-extension/popup.css
 !browser-extension/README.txt
