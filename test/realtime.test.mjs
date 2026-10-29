@@ -107,7 +107,8 @@ test('a disconnect mid-stream falls back to polling the same turn without resend
   assert.equal(result.message.content, LONG);
   const final = finished(result);
   assert.equal(final.streaming.source, 'realtime');
-  assert.equal(final.streaming.realtime.fallback_reason, 'disconnected');
+  // Native WebSocket may report an error before close for an abrupt disconnect.
+  assert.match(final.streaming.realtime.fallback_reason, /^(?:disconnected|socket_error)$/);
   assert(deltas(result).length >= 2, 'text before the disconnect was already streamed');
   assert.equal(upstream.sends.length, 1, 'the accepted message is never resent');
   assert.equal(upstream.cancels.length, 0);

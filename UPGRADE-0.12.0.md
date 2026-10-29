@@ -135,7 +135,7 @@ Node 22 起内置的 WebSocket（undici）支持 `new WebSocket(url, { headers }
 | `missing_user_account` / `missing_client_version` | 凭证缺少握手所需请求头：重新同步凭证，或设置 `LINEAR_REALTIME_CLIENT_VERSION` |
 | `noauth` / `handshake_rejected` | Linear 拒绝握手：检查 Cookie 是否有效、版本号是否过旧 |
 | `connect_failed` / `connect_timeout` / `closed_before_ready` | 服务器无法直连 `wss://sync.linear.app`：检查出站网络和代理 |
-| `disconnected` / `idle_timeout` | 生成中断开：已自动轮询补全；频繁出现时检查网络 |
+| `disconnected` / `socket_error` / `idle_timeout` | 实时连接中断或异常：已自动轮询补全；频繁出现时检查网络 |
 | `message_too_large` / `binary_protocol` / `server_error` | 协议或体积与预期不同：可增大上限或关闭实时通道，并反馈计数 |
 
 若 `realtime.answer_deltas` 大于 0 但 `anchors` 为 `none`，说明 Linear 没有发送可确认起点的 `text` 消息，需要按实际消息调整起点规则；若频繁出现 `linear_stream_rewritten`，先设置 `LINEAR_REALTIME=off`，并提供结束 chunk 中的 `streaming` 计数（不含正文）以便分析。
