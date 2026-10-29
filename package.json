@@ -1,6 +1,6 @@
 {
   "name": "linear-agent-gateway",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,9 +8,10 @@
   },
   "scripts": {
     "start": "node --preserve-symlinks --preserve-symlinks-main server.mjs",
-    "test": "node --preserve-symlinks --preserve-symlinks-main --test test/gateway.test.mjs test/accounts.test.mjs test/routing.test.mjs test/config.test.mjs test/client-keys.test.mjs test/admin-auth.test.mjs test/capture-extension.test.mjs test/tool-protocol.test.mjs test/tool-calling.test.mjs test/tool-sessions.test.mjs test/streaming.test.mjs test/concurrency.test.mjs test/e2e-coding-client.test.mjs test/credential-sync.test.mjs test/protocol-safety.test.mjs",
+    "test": "node --preserve-symlinks --preserve-symlinks-main --test test/gateway.test.mjs test/accounts.test.mjs test/routing.test.mjs test/config.test.mjs test/client-keys.test.mjs test/admin-auth.test.mjs test/capture-extension.test.mjs test/tool-protocol.test.mjs test/tool-calling.test.mjs test/tool-sessions.test.mjs test/streaming.test.mjs test/concurrency.test.mjs test/e2e-coding-client.test.mjs test/credential-sync.test.mjs test/protocol-safety.test.mjs test/realtime.test.mjs",
     "test:models": "node --preserve-symlinks --preserve-symlinks-main scripts/test-models.mjs",
     "probe:tools": "node --preserve-symlinks --preserve-symlinks-main scripts/probe-upstream-tools.mjs",
-    "e2e:client": "node --preserve-symlinks --preserve-symlinks-main scripts/local-coding-client.mjs"
+    "e2e:client": "node --preserve-symlinks --preserve-symlinks-main scripts/local-coding-client.mjs",
+    "probe:realtime": "node --preserve-symlinks --preserve-symlinks-main scripts/probe-realtime.mjs"
   }
 }

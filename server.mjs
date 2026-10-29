@@ -33,13 +33,16 @@ const credentialSync = new CredentialSync(runtimeDir, accounts); await credentia
 const onError = event => console.error(JSON.stringify(event));
 const toolSessions = new ToolSessionStore(runtimeDir, { ttlMs: config.toolSessions.ttlSeconds * 1000, idempotencyMs: config.toolSessions.idempotencySeconds * 1000, onError });
 await toolSessions.initialize();
-const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, adminAuth, credentialSync, modelsProvider, toolSessions, pollMs: config.pollMs, timeoutMs: config.timeoutMs, maxConcurrency: config.maxConcurrency, accountConcurrency: config.accountConcurrency, maxQueue: config.maxQueue, maxBodyBytes: config.maxBodyBytes, chat: config.chat, onError });
+// Timings and fallback reasons only; no message content, identifiers or credentials.
+const onTiming = config.timingLog ? event => console.log(JSON.stringify(event)) : () => {};
+const server = createGateway({ apiKey: access.api_key, sessionFile, accountStore: accounts, accountRouter, clientKeys, adminAuth, credentialSync, modelsProvider, toolSessions, pollMs: config.pollMs, timeoutMs: config.timeoutMs, maxConcurrency: config.maxConcurrency, accountConcurrency: config.accountConcurrency, maxQueue: config.maxQueue, maxBodyBytes: config.maxBodyBytes, chat: config.chat, realtime: config.realtime, onError, onTiming });
 server.listen(config.port, config.host, () => {
   const address = config.host.includes(':') ? `[${config.host}]` : config.host;
   console.log(`Linear Agent gateway: http://${address}:${config.port}/v1`);
   console.log(`Administrator setup/login: http://${address}:${config.port}/login`);
   console.log(`Initialization key file: ${fileURLToPath(new URL('access.json', runtimeDir))}`);
   console.log(`Client tools: ${config.chat.clientTools === 'off' ? 'off (text-only compatibility)' : 'structured-output adapter (experimental)'}; streaming: ${config.chat.streamMode}; concurrency: ${config.maxConcurrency} global / ${config.accountConcurrency} per account, ${config.maxQueue} outstanding.`);
+  console.log(`Realtime body channel: ${config.realtime.mode === 'off' ? 'off (polling only)' : `on (${config.realtime.subscription} subscription, falls back to polling)`}${config.chat.streamMode === 'buffered' ? '; not used while LINEAR_STREAM_MODE=buffered' : ''}.`);
 });
 server.on('error', error => { console.error(`Gateway startup failed: ${error.code ?? 'unknown'}`); process.exitCode = 1; });
 let stopping = false;

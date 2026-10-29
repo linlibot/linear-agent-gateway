@@ -113,7 +113,9 @@ function validateInputDoc(node, allowed, path = 'bodyData') {
 
 /**
  * new MockLinear({ model }) where model(turn) returns
- * { markdown, internalTools?, chunks?, error?, status?, waitPolls?, commentary? } for each sent message.
+ * { markdown, internalTools?, chunks?, error?, status?, waitPolls?, commentary?, hold?, body?, bodyData? } for each sent message.
+ * `hold: true` keeps the turn active (with no answer text, like Linear's GraphQL during
+ * generation) until `release(turnId)`; `body`/`bodyData` override the final rendering.
  */
 export class MockLinear {
   constructor({ model, detailedRead = true, keepFenceInfo = true, richInput = true, onSend } = {}) {
@@ -124,6 +126,7 @@ export class MockLinear {
     this.keepFenceInfo = keepFenceInfo;
     this.onSend = onSend;
     this.conversations = new Map();
+    this.turnsById = new Map();
     this.sends = [];
     this.reads = 0;
     this.cancels = [];
@@ -132,7 +135,13 @@ export class MockLinear {
     this.fetch = this.fetch.bind(this);
   }
   client(options = {}) {
-    return new LinearClient({ headers: { cookie: 'MOCK_ONLY_COOKIE', user: 'mock-user', organization: 'mock-org' } }, { fetchImpl: this.fetch, pollMs: options.pollMs ?? 1 });
+    const headers = { cookie: 'MOCK_ONLY_COOKIE', user: 'mock-user', organization: 'mock-org', ...options.headers };
+    return new LinearClient({ headers }, { fetchImpl: this.fetch, pollMs: options.pollMs ?? 1, realtime: options.realtime ?? null });
+  }
+  /** Lets a held turn complete on the next GraphQL read. */
+  release(turnId) {
+    const entry = this.turnsById.get(turnId);
+    if (entry) entry.turn.held = false;
   }
   get conversationCount() { return this.conversations.size; }
   async fetch(url, options) {
@@ -167,8 +176,9 @@ export class MockLinear {
     this.onSend?.(record);
     conversation.parts.push({ __typename: 'AiConversationPromptPart', id: input.userMessageId, type: 'prompt', metadata: { turnId: input.userMessageId, phase: null } });
     const reply = await this.model({ conversation, input, doc: input.bodyData, text: docText(input.bodyData), turnNumber, sendIndex: this.sends.length - 1 }) ?? { markdown: '' };
-    const turn = { id: turnId, reply, polls: 0, revealed: 0, chunks: Math.max(1, reply.chunks ?? 1), waitPolls: reply.waitPolls ?? 0, cancelled: false };
+    const turn = { id: turnId, reply, polls: 0, revealed: 0, chunks: Math.max(1, reply.chunks ?? 1), waitPolls: reply.waitPolls ?? 0, cancelled: false, held: reply.hold === true };
     conversation.turns.push(turn);
+    this.turnsById.set(turnId, { conversation, turn });
     conversation.turn = turn;
     conversation.status = 'active';
     this.activeTurns++;
@@ -182,7 +192,7 @@ export class MockLinear {
     const turn = conversation.turn;
     if (!turn || conversation.status !== 'active') return;
     turn.polls++;
-    if (turn.polls <= turn.waitPolls) return;
+    if (turn.polls <= turn.waitPolls || turn.held) return;
     const { reply } = turn;
     conversation.parts = conversation.parts.filter(p => p.metadata?.turnId !== turn.id);
     if (reply.error) {
@@ -198,7 +208,7 @@ export class MockLinear {
     const markdown = reply.markdown ?? '';
     const complete = turn.revealed >= turn.chunks;
     const visible = complete ? markdown : markdown.slice(0, Math.floor(markdown.length * turn.revealed / turn.chunks));
-    if (visible) conversation.parts.push({ __typename: 'AiConversationTextPart', id: turn.id + ':0', type: 'text', metadata: { turnId: turn.id, phase: 'answer', startedAt: 'start', ...(complete ? { endedAt: 'end' } : {}) }, body: visible, bodyData: markdownToDoc(visible, { keepFenceInfo: this.keepFenceInfo }) });
+    if (visible) conversation.parts.push({ __typename: 'AiConversationTextPart', id: turn.id + ':0', type: 'text', metadata: { turnId: turn.id, phase: 'answer', startedAt: 'start', ...(complete ? { endedAt: 'end' } : {}) }, body: complete && reply.body !== undefined ? reply.body : visible, bodyData: complete && reply.bodyData ? reply.bodyData : markdownToDoc(visible, { keepFenceInfo: this.keepFenceInfo }) });
     if (complete) { conversation.status = 'complete'; this.finishTurn(conversation); }
   }
   read(id, detailed) {

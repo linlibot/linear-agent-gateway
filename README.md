@@ -4,6 +4,8 @@
 
 浏览器页面与 API Base URL 均为 `http://127.0.0.1:8089/v1`。默认模型入口为 `linear-agent`，也可选择已实测的模型请求参数。支持 Node.js 22 或更新版本直接启动，也支持 Docker Compose 部署，无第三方运行依赖。
 
+0.12.0 新增：**实时正文通道**。流式请求与 GraphQL 发送并行连接 Linear 同步 WebSocket，订阅会话并只转发当前 assistant 回合的 `phase=answer` 正文；失败时轮询同一回合，不重发消息。2026-10-29 本机真实账户测试：长文实时首字 4.35 秒，关闭实时后为 22.94 秒；HTML 实时首字 3.67 秒，完整代码与最终快照逐字一致。数字来自少量独立新对话，不是所有模型的延迟保证。详见 [UPGRADE-0.12.0.md](UPGRADE-0.12.0.md)。
+
 0.11.0 新增（详见下文对应章节）：
 
 - **客户端工具调用（实验性）**：接收标准 `tools` / `tool_choice` / `parallel_tool_calls`，返回标准 `tool_calls` 与 `finish_reason: "tool_calls"`，接受 `assistant.tool_calls` 与 `role: "tool"` 历史，可供 Cline、Roo Code 等本地编程客户端读写本地文件、执行本地命令。Linear 上游没有第三方函数接口，因此由网关把工具定义转成严格的结构化输出协议，只有通过 nonce、工具名和 JSON Schema 校验的输出才会变成 `tool_calls`。
@@ -91,6 +93,19 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8089/v1/chat/completions' `
 | `LINEAR_TOOL_SESSION_TTL_SECONDS`（86400） | 工具循环会话记录的保留时间 |
 | `LINEAR_IDEMPOTENCY_SECONDS`（300） | 已完成的工具结果请求在多长时间内按重复请求直接返回原结果，0 关闭 |
 
+0.12.0 新增的环境变量（均可省略）：
+
+| 变量 | 作用 |
+| --- | --- |
+| `LINEAR_REALTIME`（`ws`） | `ws` 流式请求使用实时正文通道；`off` 只轮询（0.11.0 行为）。`LINEAR_STREAM_MODE=buffered` 时不使用 |
+| `LINEAR_REALTIME_SUBSCRIPTION`（`conversation`） | 默认订阅 `AiConversation` 并过滤当前 turn；可选 `turn` 订阅 `AiConversationTurn`（本机部分 HTML 回合未推送正文）。只订阅一种，不重复转发 |
+| `LINEAR_REALTIME_URL`（`wss://sync.linear.app/`） | 只允许 `linear.app` 域名下的 `wss://` 地址，因为连接会携带会话 Cookie |
+| `LINEAR_REALTIME_CLIENT_VERSION`（空） | 账号凭证缺少 `linear-client-version` 头时使用的握手版本；正常留空，由扩展采集当前值 |
+| `LINEAR_REALTIME_POLL_MS`（3000） | 正文正在实时到达时的 GraphQL 轮询间隔；正文停顿或连接失效时回到 `LINEAR_POLL_MS` |
+| `LINEAR_REALTIME_CONNECT_TIMEOUT_MS`（5000） | 连接加握手的超时，超时后该请求只轮询 |
+| `LINEAR_REALTIME_MAX_MESSAGE_BYTES`（4 MiB） | 单条 WebSocket 消息上限，超出则该请求退回轮询 |
+| `LINEAR_TIMING_LOG`（`1`） | 每个请求输出一行 JSON 计时日志（不含正文、凭证或 ID），`0` 关闭 |
+
 ## 管理员账号密码
 
 0.8.0 起，`/accounts`、`/keys`、`/admin/security` 以及对应的管理 API 均要求管理员密码登录。未初始化时，后台跳转到 `/setup`；设置完成后，未登录访问会跳转到 `/login`。原 `access.json` 密钥无法绕过后台登录，已有调用 Key 可继续读取模型和发送聊天。
@@ -174,9 +189,9 @@ docker compose up -d --build
 docker compose down
 ```
 
-### 升级到 0.11.0 与回滚
+### 升级到 0.12.0 与回滚
 
-完整步骤、测试证据及文件清单见 [UPGRADE-0.11.0.md](UPGRADE-0.11.0.md)。本次只修改本地项目，未连接或更新 AWS 服务；更新时保留数据卷与现有 Caddy 配置。
+0.12.0 的实时通道、关闭方式、回滚和最少验证步骤见 [UPGRADE-0.12.0.md](UPGRADE-0.12.0.md)；不新增 npm 依赖，Dockerfile 不变。只想关闭实时通道时，在 `.env` 设置 `LINEAR_REALTIME=off` 并重新创建服务即可，不需要回滚镜像。0.11.0 的完整步骤、测试证据及文件清单见 [UPGRADE-0.11.0.md](UPGRADE-0.11.0.md)。本次只修改本地项目，未连接或更新 AWS 服务；更新时保留数据卷与现有 Caddy 配置。
 
 备份或迁移现有账户时，先停止网关以取得一致快照。下面把容器中的整个运行目录备份到本机；这个目录已被 Git 忽略，仍应只在自己的机器之间传递：
 
@@ -317,12 +332,19 @@ JSON 响应中，`message.content` 为模型写在代码块之前的说明文字
 
 ## 流式输出
 
-- 网关使用轮询（`LINEAR_POLL_MS`）；HTTP 订阅探测报上游错误，WebSocket 尚未验证。
-- 每次轮询时，网关把当前回合中已经不会再变化的文本立即作为 `delta.content` 发送：已结束的 part 全部发送，生成中的 part 只发送最后一个块之前的内容；分隔符随后续块一起发送；完整 HTML 文档保留到结束再整体发送；带工具时，代码块之前的文字可以提前发送，代码块及之后的内容等回合结束并校验后再发送。
-- 上游如果只在结束时给出回复，就只有一个内容 delta。2026-10-28 实测短文及 11,957 字符的 HTML 回复均只在结束时发布正文，长回复期间 44 次运行中轮询无正文，因此当前实测仍是缓冲式 SSE。`streaming.progressive_chunks` 表示完成前已转发的次数。若上游改写已转发前缀，返回 `linear_stream_rewritten` 错误，不拼接重复段落；丢弃该轮部分文本后可切换 `buffered`。
-- 不输出 reasoning 与 commentary 阶段的内容；Linear 内置工具只输出名称。
-- 每 15 秒发送一次 SSE 注释心跳；客户端断开时取消上游回合。`LINEAR_STREAM_MODE=buffered` 恢复旧版的一次性输出。
-- 上游在生成过程中是否逐步发布文本，以 `scripts/probe-upstream-tools.mjs --send` 输出的 `incremental_text_observed` 为准。
+此前同一回复的诊断显示：实时接口约 4.3 秒收到正文，而 GraphQL 约 16.8 秒才读到正文。0.12.0 接入这一通道后，真实客户端复测长文首字 4.35 秒、HTML 首字 3.67 秒；HTML 输出（含围栏，共 4,534 个 UTF-16 代码单元）与最终快照完全一致。关闭实时的独立长文对照首字为 22.94 秒。尚未验证用户的 New API 或 Caddy 转发链路。
+
+- **实时通道（`LINEAR_REALTIME=ws`，默认）**：`stream: true` 且 `LINEAR_STREAM_MODE=incremental` 时，每个请求与 GraphQL 发送并行建立一条 WebSocket，携带该账号已保存的 Cookie、`Origin: https://linear.app`、User-Agent 及 `userId` / `userAccountId` 查询参数，发送 `hshk` 握手（`clientVersion`、`clientDatabaseId` 取自扩展采集的请求头）。收到带 `sync` 的 `hshk` 视为认证成功；Linear 接受消息后订阅当前回合的 `parts`。请求结束、取消或超时时退订并关闭连接；每 20 秒发送 `ping`，60 秒无任何消息即视为失效。
+- **只转发当前回合的答案正文**：只处理订阅对象匹配、属于当前 assistant turn、`phase=answer` 的 `text` / `textDelta`；`textDelta` 按对应 `text` part 的 ID 继承身份。其他对话、旧回合、reasoning、commentary 及未知类型一律不转发。相同 cursor 的重复消息与倒退的 cursor 丢弃；带 `generation` 时丢弃旧代消息；`provenance` 变化只计数。只有从开头看到的 part（空快照、纯文本快照、与缓冲增量一致的快照，或起点在文档开头的 steps）才会转发，避免缺失开头。
+- **只发送真实正文**：role 事件和心跳不计为首字；不插入占位文字，也不拆分最终答案。暂缓发送尾部空白和被拆开的代理对字符；part 开头在能判断是否为 HTML 文档之前暂缓，完整 HTML 文档放入 `html` 代码围栏逐步发送（与轮询路径的最终渲染一致）；Markdown 和代码围栏按模型原文发送。
+- **工具模式**：只发送协议代码块之前的完整文字行；遇到代码围栏、`tool_calls`、nonce、以 `{` / `[` 开头的行等协议迹象即停止，工具 JSON 不会提前出现。工具调用仍等整个回合解析，并通过 nonce、工具名、JSON 与 Schema 校验后才发送；修正回合不实时转发。
+- **最终一致性**：GraphQL 仍是完成、错误和最终文本的依据。最终校验只允许列表标记、编号、围栏语言名和配对强调等展示差异；代码运算符、缩进、标点、小数、URL、标识符与 emoji 必须一致。字母数字骨架仅用于识别流起点，不能证明最终相等。真实事件省略开头代码围栏时，只在文档替换步骤明确证明创建起始代码块、且语言行匹配时恢复围栏。无法安全衔接时返回 `linear_stream_rewritten`，不拼接不同版本。
+- **轮询兜底**：没有 `useraccount` / `linear-client-version` 凭证头、握手超时、`noauth`、异常或超大消息、连接中断时，该请求继续读取同一个 Linear 回合（已接受的消息绝不重发），并在最后补发剩余文本。正文正在实时到达时 GraphQL 轮询放慢到 `LINEAR_REALTIME_POLL_MS`；正文停顿约 0.6 秒、收到完成快照或连接失效时立即恢复正常轮询，避免无用连接拖慢完成检测。
+- 结束 chunk 的 `streaming` 包含 `source`（`realtime` / `polling` / `final`）、`progressive_chunks`、`consistency`、`realtime_stopped` 及 `realtime` 计数（状态、`fallback_reason`、增量数、重复、过滤等，不含正文）；顶层 `timings` 给出相对上游发送的毫秒数：`send_ack_ms`、`realtime_ready_ms`、`first_stream_event_ms`、`first_answer_delta_ms`、`first_text_ms`、`first_tool_call_ms`、`upstream_complete_ms`、`finish_ms`。JSON 响应也带 `timings`。
+- 请求头 `x-linear-realtime: off` 可让单个请求改用轮询，便于同一部署上做前后对比；它不能在服务端关闭实时通道时强制开启。
+- 轮询路径（`LINEAR_REALTIME=off`、请求头关闭或连接失败）保持 0.11.0 行为：转发轮询时已经稳定的块，上游只在结束时给出回复则只有一个内容 delta；上游改写已转发前缀时返回 `linear_stream_rewritten`。
+- 每 15 秒发送一次 SSE 注释心跳；客户端断开时取消上游回合并释放 WebSocket。`LINEAR_STREAM_MODE=buffered` 恢复旧版的一次性输出，也不使用实时通道。
+- 实时通道需要服务器能直接访问 `wss://sync.linear.app`（Node 内置 WebSocket 不读取 `HTTPS_PROXY`）。协议是 Linear 网页的内部接口，可能随前端更新变化；变化时会退回轮询，必要时设置 `LINEAR_REALTIME=off`。
 
 ## 并发与排队
 
@@ -373,14 +395,15 @@ JSON 响应中，`message.content` 为模型写在代码块之前的说明文字
 | 工具定义、选择、Schema、多调用、结果、失败恢复、三轮循环 | 通过 | 标准 SSE 工具调用与本地 HTML 读写修改闭环通过 |
 | 固定原对话及账号、重启、重复请求保护 | 通过 | 真实工具闭环后四轮为 native；重启和失败重试仅模拟验证 |
 | 详细读取字段 | 通过 | 接口接受，真实回复可读取 |
-| 实时正文增量 | 模拟增量通过 | 本次短文和长 HTML 均只在结束发布正文，仍为缓冲 SSE |
+| 实时正文增量（轮询） | 模拟增量通过 | 本次短文和长 HTML 均只在结束发布正文，仍为缓冲 SSE |
+| 实时正文通道（0.12.0） | 35 项专项测试通过；真实问候、长文、HTML 与工具回合已测 | HTML 代码逐字比对与脚本语法通过；New API/Caddy 转发待验证，见 UPGRADE-0.12.0.md |
 | Cline / Roo Code 桌面扩展 | 请求格式及本地测试客户端通过 | 未进行桌面扩展 UI 联调 |
 
 ## 能力边界
 
 - 选择 `linear-agent` 时不传上游 `model` 参数，使用上游默认配置。选择其他已测试条目时原样传递参数，不自动降级到默认入口。上游实际采用的模型身份仍未核验；候选条目通过请求及回复测试不等于模型身份已经验证。
 - `system` / `developer` 历史会作为调用方文本发送，不能替换 Linear 自己的系统指令。
-- 通过轮询读取回复。SSE 先发送 role，再转发轮询时已经稳定的文本；上游只在结束时给出回复则一次输出。没有实现 Linear 同步引擎 / WebSocket 的逐 token 流（见“流式输出”）。
+- 流式请求默认通过 Linear 同步 WebSocket 转发正文增量，失败时退回轮询；完成、错误与最终文本仍以 GraphQL 为准（见“流式输出”）。真实延迟已有本机样本，网页内部协议仍可能变化。
 - 上游没有提供 Token 用量，因此 `usage` 为 `null`。
 - 暂不支持图片、文件、Responses 或 Messages 协议。`temperature`、`max_tokens` 等采样参数会被接受但不生效，并在 `ignored_parameters` 中列出；`LINEAR_STRICT_PARAMETERS=1` 时改为返回 400。未知字段仍返回 400。
 - 客户端工具调用为实验性结构化输出适配，不是上游原生函数调用；限制见“客户端工具调用”一节。
@@ -475,6 +498,10 @@ node --preserve-symlinks --preserve-symlinks-main .\scripts\smoke-test.mjs
 npm run probe:tools
 # 本地编程客户端端到端测试（在临时目录中执行工具，需要调用 Key）：
 npm run e2e:client -- --base http://127.0.0.1:8089/v1 --stream
+# 实时正文通道首字计时（真实请求约 8 次 Agent 回复；不执行工具，只记录计时、长度和哈希）：
+$env:LINEAR_GATEWAY_KEY = Read-Host '调用 Key'
+npm run probe:realtime -- --base http://127.0.0.1:8089/v1 --compare --out outputs/realtime-probe.json
+Remove-Item Env:LINEAR_GATEWAY_KEY
 ```
 
 可设置 `LINEAR_TEST_MODEL=openai/gpt-6.1-sol` 让 smoke test 验证指定模型参数；`LINEAR_TEST_EFFORT=high` 验证指定强度及 JSON、原生续聊、SSE 的档位标识。真实测试均可用 `LINEAR_ACCOUNT_ID=acct-…` 指定账户；未指定时，候选模型探测使用默认账户，smoke test 的新对话遵循当前选号策略，续聊固定原账户。模型列表按账户读取 `.local-runtime/model-validations/{account_id}.json`，不存在或读取失败时仅开放默认入口；原模型报告只迁移到原账户。
@@ -491,5 +518,7 @@ npm run e2e:client -- --base http://127.0.0.1:8089/v1 --stream
 - `test/e2e-coding-client.test.mjs`：本地编程客户端（`scripts/local-coding-client.mjs`）在临时目录完成“创建 index.html → 读取 → 改标题 → 验证”，并在完整重放模式下重复；编写代码与测试、本地运行 `node --test`、按失败输出打补丁并重跑；用户拒绝授权；路径不能逃出工作区。
 
 以上均为模拟上游结果，真实上游状态见“验证状态（0.11.0）”。
+
+2026-10-29（0.12.0）：本机 Node 22.14.0 完整串行回归 189/189，通过其中的 35 项实时专项测试。新增保护包括代码操作符、缩进、URL、标点和标识符的一致性，以及真实起始代码围栏事件的恢复。真实账户问候、长文、HTML、工具调用和连接超时兜底的结果见 UPGRADE-0.12.0.md；New API/Caddy 端到端转发尚未验证。
 
 Cherry 提示 `Parameter tools is not supported` 时，升级至 0.3.1 或更新版本并重启网关。0.11.0 起 Cherry 附带的工具（文件读取、联网搜索、MCP）会作为客户端工具提供给模型，由 Cherry 执行；如只需要旧版的纯文本 / HTML 代码生成，设置 `LINEAR_CLIENT_TOOLS=off`。HTML 代码可以在 Cherry 中复制或预览，只有客户端执行了写文件工具时才会写入本机文件。

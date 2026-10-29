@@ -51,14 +51,14 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   catch { throw new GatewayError(400, 'invalid_json', 'Request body is not valid JSON.'); }
 }
 
-export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, adminAuth, credentialSync, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, maxConcurrency = 4, accountConcurrency = 1, maxBodyBytes = 8 * 1024 * 1024, chat = {}, toolSessions = new ToolSessionStore(null), clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {} }) {
+export function createGateway({ apiKey, sessionFile, accountStore, accountRouter, clientKeys, adminAuth, credentialSync, pollMs = 1500, timeoutMs = 180000, maxQueue = 8, maxConcurrency = 4, accountConcurrency = 1, maxBodyBytes = 8 * 1024 * 1024, chat = {}, realtime = null, toolSessions = new ToolSessionStore(null), clientFactory, modelsProvider = async () => [{ id: MODEL, name: 'Linear 默认配置', object: 'model', created: 0, owned_by: 'linear', test_status: 'default', selection_verified: false }], onError = () => {}, onTiming = () => {} }) {
   let accepting = true;
   const controllers = new Set();
   const requests = new Set();
   const expectedKey = Buffer.from('Bearer ' + apiKey);
   const catalog = accountId => accountRouter ? accountRouter.models(accountId) : modelsProvider(accountId);
   const scheduler = new Scheduler({ maxConcurrency, accountConcurrency, maxQueue });
-  const completions = createChatCompletions({ accountStore, accountRouter, clientKeys, sessionFile, modelsProvider, catalog, clientFactory, pollMs, timeoutMs, scheduler, toolSessions, settings: chat, onError, controllers });
+  const completions = createChatCompletions({ accountStore, accountRouter, clientKeys, sessionFile, modelsProvider, catalog, clientFactory, pollMs, timeoutMs, scheduler, toolSessions, settings: chat, realtime, onError, onTiming, controllers });
   const server = http.createServer(async (req, res) => {
     let finish;
     const completion = new Promise(resolve => { finish = resolve; });

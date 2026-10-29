@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { GatewayError } from './errors.mjs';
 import { textDoc } from './rich-doc.mjs';
 import { normalizeMessages } from './messages.mjs';
@@ -229,11 +228,33 @@ export function validateRequest(body, allowedModels = [MODEL], { clientTools = '
   return { mode: 'chat', text, ...common, ...(compatibility ? { compatibility } : {}) };
 }
 
+// Sleeps between polls; `wake()` ends the current wait early (or the next one, when
+// nothing is waiting yet and `pending` is set). Aborting rejects with the signal reason.
+function waiter(signal) {
+  let pending = false, resolve = null;
+  return {
+    wake(keep = true) { if (resolve) resolve(); else if (keep) pending = true; },
+    wait(ms) {
+      if (signal?.aborted) return Promise.reject(signal.reason);
+      if (pending) { pending = false; return Promise.resolve(); }
+      return new Promise((done, fail) => {
+        const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); resolve = null; done(); };
+        const abort = () => { clearTimeout(timer); resolve = null; fail(signal.reason); };
+        const timer = setTimeout(finish, ms);
+        resolve = finish;
+        signal?.addEventListener('abort', abort, { once: true });
+      });
+    },
+  };
+}
+
 export class LinearClient {
-  constructor(session, { fetchImpl = fetch, pollMs = 1500 } = {}) {
+  /** `realtime` is an optional channel factory (see realtime.mjs); without it the client only polls. */
+  constructor(session, { fetchImpl = fetch, pollMs = 1500, realtime = null } = {}) {
     this.session = session;
     this.fetch = fetchImpl;
     this.pollMs = pollMs;
+    this.realtime = realtime;
   }
   async call(query, variables, signal) {
     let response;
@@ -273,40 +294,65 @@ export class LinearClient {
    * Sends one user message and polls until the assistant turn completes.
    * `doc` (a Linear rich-text document) takes precedence over `text`.
    * `onProgress({ parts, status })` sees every poll of the current turn.
+   * With `live.realtime` and a channel factory, the realtime channel connects in
+   * parallel with the send and `live.onRealtime(turn)` sees every change of the
+   * turn's streamed text; polling then only waits longer between reads and is woken
+   * early when the stream suggests the turn finished. The send is never repeated.
    */
-  async chat({ text, doc, conversationId, requestedModel = MODEL, reasoningEffort }, signal, onAccepted = () => {}, onProgress) {
+  async chat({ text, doc, conversationId, requestedModel = MODEL, reasoningEffort }, signal, onAccepted = () => {}, onProgress, live = {}) {
     const proposedId = conversationId ?? randomUUID();
-    const data = await this.call(SEND_QUERY, { input: { conversationId: proposedId, userMessageId: randomUUID(), context: [], bodyData: doc ?? textDoc(text), resume: true, ...(requestedModel === MODEL ? {} : { model: requestedModel }), ...(reasoningEffort ? { reasoningEffort } : {}) } }, signal);
-    const sent = data.aiConversationSendMessage;
-    if (!sent?.success || !sent.aiConversation?.id || !sent.assistantMessage?.id) throw new GatewayError(502, 'linear_send_failed', 'Linear did not confirm the message.');
-    const id = sent.aiConversation.id;
-    let complete = false, emptyCompletePolls = 0;
+    const pause = waiter(signal);
+    const channel = live.realtime && this.realtime ? this.realtime(this.session.headers, { timing: live.timing, onUpdate: turn => live.onRealtime?.(turn), onHint: reason => pause.wake(reason !== 'realtime_failed') }) : null;
+    let id = null, complete = false;
     try {
-      await onAccepted(id);
-      for (;;) {
-        signal?.throwIfAborted();
-        const conversation = await this.read(id, signal);
-        if (!conversation) throw new GatewayError(502, 'linear_conversation_missing', 'Linear did not return the conversation.');
-        const parts = currentTurnParts(conversation, sent.assistantMessage.id);
-        if (parts.some(p => p.type === 'error') || ['error', 'cancelled', 'canceled'].includes(conversation.status)) {
-          complete = true;
-          throw new GatewayError(502, 'linear_agent_error', 'Linear Agent could not complete the reply.');
-        }
-        if (parts.some(p => p.type === 'elicitation') || !['complete', 'active', 'pending'].includes(conversation.status)) {
-          throw new GatewayError(409, 'linear_action_required', 'Linear requires an action in its conversation page (a confirmation for one of its own built-in tools). Client tools are separate.');
-        }
-        const text = answerText(parts);
-        if (conversation.status === 'complete' && !text) emptyCompletePolls++;
-        const done = conversation.status === 'complete' && (text || emptyCompletePolls >= EMPTY_COMPLETE_POLLS);
-        if (onProgress) await onProgress({ parts, status: conversation.status, complete: Boolean(done) });
-        if (done) {
-          complete = true;
-          return { text, conversationId: id, assistantMessageId: sent.assistantMessage.id, markdown: answerMarkdown(parts), parts: answerParts(parts), linearToolCalls: linearToolCalls(parts) };
-        }
-        await sleep(this.pollMs, undefined, { signal });
-      }
+      live.timing?.start();
+      channel?.start();
+      const data = await this.call(SEND_QUERY, { input: { conversationId: proposedId, userMessageId: randomUUID(), context: [], bodyData: doc ?? textDoc(text), resume: true, ...(requestedModel === MODEL ? {} : { model: requestedModel }), ...(reasoningEffort ? { reasoningEffort } : {}) } }, signal);
+      const sent = data.aiConversationSendMessage;
+      if (!sent?.success || !sent.aiConversation?.id || !sent.assistantMessage?.id) throw new GatewayError(502, 'linear_send_failed', 'Linear did not confirm the message.');
+      live.timing?.mark('send_ack');
+      id = sent.aiConversation.id;
+      channel?.watch({ conversationId: id, assistantMessageId: sent.assistantMessage.id });
+      return await this.follow(id, sent.assistantMessage.id, { signal, onAccepted, onProgress, channel, pause, timing: live.timing, done: () => { complete = true; } });
+    } catch (error) {
+      if (channel && error && typeof error === 'object') error.realtime ??= channel.summary();
+      throw error;
     } finally {
-      if (!complete) await this.cancel(id);
+      channel?.close();
+      if (id && !complete) await this.cancel(id);
+    }
+  }
+  /** Polls an accepted turn until it completes. GraphQL alone decides completion and errors. */
+  async follow(id, assistantId, { signal, onAccepted, onProgress, channel, pause, timing, done: markComplete }) {
+    let emptyCompletePolls = 0;
+    await onAccepted(id);
+    for (;;) {
+      signal?.throwIfAborted();
+      const conversation = await this.read(id, signal);
+      if (!conversation) throw new GatewayError(502, 'linear_conversation_missing', 'Linear did not return the conversation.');
+      const parts = currentTurnParts(conversation, assistantId);
+      channel?.identify(parts);
+      if (parts.some(p => p.type === 'error') || ['error', 'cancelled', 'canceled'].includes(conversation.status)) {
+        markComplete();
+        throw new GatewayError(502, 'linear_agent_error', 'Linear Agent could not complete the reply.');
+      }
+      if (parts.some(p => p.type === 'elicitation') || !['complete', 'active', 'pending'].includes(conversation.status)) {
+        throw new GatewayError(409, 'linear_action_required', 'Linear requires an action in its conversation page (a confirmation for one of its own built-in tools). Client tools are separate.');
+      }
+      const text = answerText(parts);
+      if (conversation.status === 'complete' && !text) emptyCompletePolls++;
+      const done = conversation.status === 'complete' && (text || emptyCompletePolls >= EMPTY_COMPLETE_POLLS);
+      if (onProgress) await onProgress({ parts, status: conversation.status, complete: Boolean(done) });
+      if (done) {
+        markComplete();
+        timing?.mark('upstream_complete');
+        return { text, conversationId: id, assistantMessageId: assistantId, markdown: answerMarkdown(parts), parts: answerParts(parts), linearToolCalls: linearToolCalls(parts), ...(channel ? { realtime: channel.summary(), turn: channel.turn } : {}) };
+      }
+      // While answer text is actively streaming, polls only detect completion and errors and
+      // can be slower; when the text pauses the stream wakes the loop and the normal interval
+      // applies again, so a silent or useless socket never slows completion detection.
+      const slow = channel?.streaming && conversation.status !== 'complete';
+      await pause.wait(slow ? Math.max(this.pollMs, channel.settings.healthyPollMs) : this.pollMs);
     }
   }
 }

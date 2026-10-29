@@ -5,7 +5,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { GatewayError, LinearClient, loadSession, normalizeSession, MODEL, READ_QUERY, validateRequest } from './upstream.mjs';
 import { canFailOver } from './routing.mjs';
 import { ChatStream } from './sse.mjs';
-import { ProgressiveText } from './progressive.mjs';
+import { LiveText } from './progressive.mjs';
+import { REALTIME_URL, createTiming, isLinearRealtimeUrl, realtimeFactory } from './realtime.mjs';
 import { newNonce, parseToolReply, toOpenAiToolCalls, toolsFingerprint } from './tool-protocol.mjs';
 import { continuationDocument, initialDocument, repairDocument } from './prompt-builder.mjs';
 import { chainHash, FILE_CHANGE_TOOL, historyHasFileChanges, prefixHashes, toolCallNames } from './messages.mjs';
@@ -38,8 +39,35 @@ function lastAssistantIndex(messages) {
   return -1;
 }
 
-export function createChatCompletions({ accountStore, accountRouter, clientKeys, sessionFile, modelsProvider, catalog, clientFactory, pollMs, timeoutMs, scheduler, toolSessions, settings: overrides = {}, onError = () => {}, controllers }) {
+export function createChatCompletions({ accountStore, accountRouter, clientKeys, sessionFile, modelsProvider, catalog, clientFactory, pollMs, timeoutMs, scheduler, toolSessions, settings: overrides = {}, realtime = null, onError = () => {}, onTiming = () => {}, controllers }) {
   const settings = { ...DEFAULT_CHAT_SETTINGS, ...overrides };
+  // Realtime channels for clients built here; off unless the server configured them. The
+  // session cookie travels on that socket, so only Linear's own wss hosts are accepted.
+  if (realtime && realtime.mode !== 'off' && !isLinearRealtimeUrl(realtime.url ?? REALTIME_URL)) throw new Error('Invalid realtime URL: use a wss:// URL on a linear.app host.');
+  const channels = realtime ? realtimeFactory(realtime, { WebSocketImpl: realtime.WebSocketImpl }) : null;
+
+  /**
+   * SSE writer for one turn: realtime text and stable polled text, whichever arrives first.
+   * `x-linear-realtime: off` on a request keeps it on polling (for A/B timing checks); it
+   * cannot turn realtime on when the server disabled it.
+   */
+  function liveStream(stream, timing, stopAtCode, input) {
+    if (!stream || settings.streamMode !== 'incremental') return null;
+    const live = new LiveText({ stopAtCode });
+    let latest = null;
+    const write = text => {
+      if (!text || !stream.started) return;
+      timing.mark('first_text');
+      stream.content(text);
+    };
+    return {
+      live, write,
+      onProgress: async ({ parts, complete }) => { if (!complete && stream.started) write(live.fromPolls(parts)); },
+      options: { realtime: input.realtime !== false, timing, onRealtime: turn => { latest = turn; if (stream.started) write(live.fromRealtime(turn)); } },
+      // Realtime text can arrive before the SSE response has started.
+      accept: onAccepted => async id => { await onAccepted(id); if (latest) write(live.fromRealtime(latest)); },
+    };
+  }
 
   async function continuationFor(input, explicitAccount, toolsHash) {
     // An explicit conversation_id always continues that conversation, whatever the setting.
@@ -73,6 +101,7 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
     let account = accountStore && (!accountRouter || body.account_id !== undefined || body.conversation_id !== undefined) ? await accountStore.resolve({ accountId: body.account_id, conversationId: body.conversation_id }) : null;
     const input = validateRequest(body, (await (account ? modelsProvider(account.id) : catalog())).map(m => m.id), { clientTools: settings.clientTools, strictParameters: settings.strictParameters });
     input.clientScope = clientKey?.id ?? 'legacy';
+    input.realtime = !/^off$/i.test(String(req.headers['x-linear-realtime'] ?? '').trim());
     const ticket = scheduler.admit();
     const controller = new AbortController();
     controllers.add(controller);
@@ -84,6 +113,14 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
     const id = 'chatcmpl-' + randomUUID();
     const created = Math.floor(Date.now() / 1000);
     const stream = input.stream ? new ChatStream(res, { id, created }) : null;
+    const timing = createTiming();
+    // One log line per answered request: timings and fallback reason, never content.
+    const report = (outcome, error) => {
+      try {
+        const channel = outcome?.response?.final?.streaming?.realtime ?? error?.realtime ?? null;
+        onTiming({ event: 'chat_timing', mode: input.mode, stream: input.stream, ...(error ? { error: error.code ?? 'internal_error' } : {}), source: outcome?.response?.final?.streaming?.source ?? null, realtime: channel?.status ?? 'off', ...(channel?.fallback_reason ? { fallback_reason: channel.fallback_reason } : {}), ...timing.snapshot() });
+      } catch {}
+    };
     let releaseGlobal, requestKey = null, continuation = null, sessionDone = false;
     try {
       releaseGlobal = await scheduler.acquireGlobal(signal);
@@ -108,7 +145,7 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
           input.requestKey = requestKey;
         }
         if (toolMode) continuation = await continuationFor(input, input.accountId !== undefined ? account : null, toolsHash);
-        const outcome = await attempts({ input, account, continuation, signal, res, stream, ids: { id, created } });
+        const outcome = await attempts({ input, account, continuation, signal, res, stream, ids: { id, created }, timing });
         if (toolMode && toolSessions) {
           const { result, accountUsed, response } = outcome;
           const assistant = { role: 'assistant', content: response.content, toolCalls: response.toolCalls.map(c => ({ id: c.id, name: c.function.name, arguments: c.function.arguments })) };
@@ -122,6 +159,7 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
         if (signal.aborted || res.destroyed) return;
         outcome.send();
         completed = true;
+        report(outcome);
       } finally {
         if (clientKey) await clientKeys.finish(clientKey.id, completed).catch(() => onError({ code: 'key_store_unavailable', status: 503 }));
       }
@@ -131,7 +169,9 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
       // to continue (e.g. deleted in the Linear app) is also abandoned, so retries replay instead
       // of failing forever.
       if (continuation?.session && !sessionDone && (continuation.accepted || CONTINUATION_BROKEN.has(cause?.code))) toolSessions.markDirty(continuation.session);
-      throw signal.aborted ? signal.reason : cause;
+      const failure = signal.aborted ? signal.reason : cause;
+      if (timing.has('send_start')) report(null, { code: failure?.code, realtime: cause?.realtime });
+      throw failure;
     } finally {
       if (continuation?.session && !sessionDone) toolSessions?.release(continuation.session);
       if (requestKey) toolSessions.endRequest(requestKey);
@@ -157,7 +197,7 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
     } else json(res, 200, { id, object: 'chat.completion', created, model: MODEL, ...metadata, ...cached.final, choices: [{ index: 0, message: { role: 'assistant', content: cached.content, ...(cached.toolCalls.length ? { tool_calls: cached.toolCalls } : {}) }, finish_reason: finish }], usage: null, conversation_id: cached.conversationId });
   }
 
-  async function attempts({ input, account, continuation, signal, res, stream, ids }) {
+  async function attempts({ input, account, continuation, signal, res, stream, ids, timing }) {
     const fixedAccount = continuation && !continuation.explicit ? (accountStore && continuation.accountId ? await accountStore.get(continuation.accountId) : null) : undefined;
     const planFor = async () => {
       if (fixedAccount !== undefined) return { accounts: [fixedAccount], strategy: 'tool_session', failover_enabled: false };
@@ -175,7 +215,7 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
       } catch (error) { release(); throw error; }
       attempted.push(account?.id ?? null);
       try {
-        const client = clientFactory ? await clientFactory(account) : new LinearClient(account ? normalizeSession(account.session) : await loadSession(sessionFile), { pollMs });
+        const client = clientFactory ? await clientFactory(account) : new LinearClient(account ? normalizeSession(account.session) : await loadSession(sessionFile), { pollMs, realtime: channels });
         if (account?.needsConversationCheck) {
           let conversation;
           try { conversation = (await client.call(READ_QUERY, { id: input.conversationId }, signal)).aiConversation; }
@@ -204,8 +244,8 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
         };
         if (input.requestKey) await toolSessions.markDispatched(input.requestKey);
         const outcome = input.mode === 'tools'
-          ? await toolTurns({ client, input, continuation, signal, onAccepted, stream, selection, res, ids })
-          : await chatTurn({ client, input, signal, onAccepted, stream, selection, res, ids });
+          ? await toolTurns({ client, input, continuation, signal, onAccepted, stream, selection, res, ids, timing })
+          : await chatTurn({ client, input, signal, onAccepted, stream, selection, res, ids, timing });
         if (accountRouter) await accountRouter.recordSuccess(account).catch(() => onError({ code: 'routing_store_unavailable', status: 503 }));
         return { ...outcome, accountUsed: account };
       } catch (error) {
@@ -240,31 +280,43 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
     }
   }
 
-  async function chatTurn({ client, input, signal, onAccepted, stream, selection, res, ids }) {
-    const progressive = stream && settings.streamMode === 'incremental' ? new ProgressiveText() : null;
-    const onProgress = progressive ? async ({ parts, complete }) => { if (!complete && stream.started) stream.content(progressive.update(parts)); } : undefined;
-    const result = await client.chat({ text: input.text, conversationId: input.conversationId, requestedModel: input.requestedModel, reasoningEffort: input.reasoningEffort }, signal, onAccepted, onProgress);
+  function streamingReport(live, result) {
+    return { ...live.report(), ...(result?.realtime ? { realtime: result.realtime } : {}) };
+  }
+
+  async function chatTurn({ client, input, signal, onAccepted, stream, selection, res, ids, timing }) {
+    const sse = liveStream(stream, timing, false, input);
+    const live = sse?.live ?? null;
+    const result = await client.chat({ text: input.text, conversationId: input.conversationId, requestedModel: input.requestedModel, reasoningEffort: input.reasoningEffort }, signal, sse ? sse.accept(onAccepted) : onAccepted, sse?.onProgress, sse ? sse.options : { timing });
     if (!result.text) throw new GatewayError(502, 'linear_empty_reply', 'Linear finished the turn without a text reply.');
     const internal = result.linearToolCalls ?? [];
     const cloud = internal.filter(name => LINEAR_CLOUD_WORK_TOOLS.has(name));
+    // Parts streamed in realtime keep the model's own Markdown; the rest is Linear's rendering.
+    const answer = live ? live.compose(result, result.turn) : result.text;
     // Only when the reply talks about files: a sandbox calculation needs no warning.
-    const content = cloud.length && FILE_HINT.test(result.text) ? appendNotice(result.text, cloudNotice(cloud)) : result.text;
-    const final = { ...(internal.length ? { linear_internal_tool_calls: internal } : {}), ...(progressive ? { streaming: { progressive_chunks: progressive.progressiveChunks, rewritten: progressive.divergent } } : {}) };
+    const content = cloud.length && FILE_HINT.test(answer) ? appendNotice(answer, cloudNotice(cloud)) : answer;
+    const final = { ...(internal.length ? { linear_internal_tool_calls: internal } : {}), ...(live ? { streaming: streamingReport(live, result) } : {}) };
     return {
       result,
       response: { content, toolCalls: [], selection, final },
       send() {
         if (signal.aborted || res.destroyed) return;
         if (stream) {
-          stream.content(progressive ? progressive.finish(content) : content);
-          if (progressive) final.streaming = { progressive_chunks: progressive.progressiveChunks, rewritten: progressive.divergent };
-          stream.finish('stop', final, input.includeUsage);
-        } else json(res, 200, { id: ids.id, object: 'chat.completion', created: ids.created, model: MODEL, ...selection, ...final, choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }], usage: null, conversation_id: result.conversationId });
+          const rest = live ? live.finish(content) : content;
+          if (live) final.streaming = streamingReport(live, result);
+          if (rest) { timing.mark('first_text'); stream.content(rest); }
+          timing.mark('finish');
+          stream.finish('stop', { ...final, timings: timing.snapshot() }, input.includeUsage);
+        } else {
+          timing.mark('first_text');
+          timing.mark('finish');
+          json(res, 200, { id: ids.id, object: 'chat.completion', created: ids.created, model: MODEL, ...selection, ...final, timings: timing.snapshot(), choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }], usage: null, conversation_id: result.conversationId });
+        }
       },
     };
   }
 
-  async function toolTurns({ client, input, continuation, signal, onAccepted, stream, selection, res, ids }) {
+  async function toolTurns({ client, input, continuation, signal, onAccepted, stream, selection, res, ids, timing }) {
     const { tools, choice, parallelToolCalls: parallel } = input;
     let format = settings.promptFormat === 'rich' && promptFormatState.richRejected ? 'plain' : settings.promptFormat;
     const names = toolCallNames(input.messages);
@@ -275,28 +327,34 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
       : initialDocument({ messages: input.messages, tools, choice, parallel, nonce, format, names });
     const builder = buildDocument();
     if (builder.length > settings.maxPromptChars) throw new GatewayError(413, 'prompt_too_large', `The tool transcript has ${builder.length} characters, above LINEAR_MAX_PROMPT_CHARS (${settings.maxPromptChars}).`);
-    const progressive = stream && settings.streamMode === 'incremental' ? new ProgressiveText({ stopAtCode: choice.mode !== 'none' }) : null;
-    const onProgress = progressive ? async ({ parts, complete }) => { if (!complete && stream.started) stream.content(progressive.update(parts)); } : undefined;
+    // Tool mode streams only complete text lines before anything protocol-like; tool calls
+    // are sent after the whole reply was parsed and validated.
+    const sse = liveStream(stream, timing, choice.mode !== 'none', input);
+    const live = sse?.live ?? null;
     const request = { requestedModel: input.requestedModel, reasoningEffort: input.reasoningEffort };
     let sent = false;
     const accept = async id => { sent = true; await onAccepted(id); };
+    const accepted = sse ? sse.accept(accept) : accept;
+    const options = sse ? sse.options : { timing };
     let result;
     try {
-      result = await client.chat({ ...request, doc: builder.build(), conversationId: continuation?.conversationId }, signal, accept, onProgress);
+      result = await client.chat({ ...request, doc: builder.build(), conversationId: continuation?.conversationId }, signal, accepted, sse?.onProgress, options);
     } catch (error) {
       // Linear rejected the message input before accepting it: resend the same content once
       // as a single plain paragraph in case its API does not take code blocks.
       if (sent || !error.invalidInput || format !== 'rich') throw error;
       format = 'plain';
-      result = await client.chat({ ...request, doc: buildDocument().build(), conversationId: continuation?.conversationId }, signal, accept, onProgress);
+      result = await client.chat({ ...request, doc: buildDocument().build(), conversationId: continuation?.conversationId }, signal, accepted, sse?.onProgress, options);
       promptFormatState.richRejected = true;
     }
+    const firstResult = result;
     const internal = [...(result.linearToolCalls ?? [])];
-    const parse = (reply, expected) => {
-      if (!reply.text?.trim() && !reply.markdown?.trim()) return { content: null, toolCalls: [], droppedCalls: [], problems: ['The reply was empty. Answer the latest message.'] };
-      return parseToolReply([reply.text, reply.markdown], { tools, choice, parallel, nonce: expected });
+    const parse = (reply, expected, raw = null) => {
+      if (!raw?.trim() && !reply.text?.trim() && !reply.markdown?.trim()) return { content: null, toolCalls: [], droppedCalls: [], problems: ['The reply was empty. Answer the latest message.'] };
+      // The model's raw text (when realtime carried and verified it) is parsed first.
+      return parseToolReply([raw, reply.text, reply.markdown], { tools, choice, parallel, nonce: expected });
     };
-    let parsed = parse(result, nonce);
+    let parsed = parse(result, nonce, live?.rawAnswer(result, result.turn));
     const firstContent = parsed.content;
     let repairs = 0;
     while (parsed.problems.length && repairs < settings.toolRepairAttempts) {
@@ -309,7 +367,9 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
     }
     if (parsed.problems.length) throw new GatewayError(502, 'tool_call_invalid', 'Linear Agent did not produce a valid client tool call, so nothing was sent to the client to execute. ' + parsed.problems.slice(0, 6).join(' ').slice(0, 1500));
     const toolCalls = toOpenAiToolCalls(parsed.toolCalls);
-    let content = repairs && !parsed.content ? firstContent : parsed.content;
+    // After a repair, keep the first reply's text when the repair has none or when it
+    // cannot follow the text the client already received.
+    let content = repairs && (!parsed.content || (live?.emitted && !live.extends(parsed.content))) ? firstContent : parsed.content;
     if (!toolCalls.length) {
       const cloud = internal.filter(name => LINEAR_CLOUD_WORK_TOOLS.has(name));
       const fileTools = tools.some(t => FILE_CHANGE_TOOL.test(t.name));
@@ -317,16 +377,16 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
       else if (content && choice.mode !== 'none' && CLAIM.test(content) && FILE_HINT.test(content) && fileTools && !historyHasFileChanges(input.messages)) content = appendNotice(content, CLAIM_NOTICE);
     }
     let streamed = null;
-    if (progressive) {
+    if (live) {
       // Text before the tool block may already be on the wire; never resend or contradict it.
-      const emitted = progressive.emitted;
-      streamed = { prefix: emitted, rest: progressive.finish(content) };
-      content = (emitted + streamed.rest) || null;
+      const prefix = live.emitted;
+      streamed = { prefix, rest: live.finish(content ?? '') };
+      content = live.emitted || null;
     }
     const final = {
       tool_protocol: { upstream_turns: repairs + 1, repair_attempts: repairs, tool_calls: toolCalls.length, dropped_tool_calls: parsed.droppedCalls.length },
       ...(internal.length ? { linear_internal_tool_calls: internal } : {}),
-      ...(progressive ? { streaming: { progressive_chunks: progressive.progressiveChunks } } : {}),
+      ...(live ? { streaming: streamingReport(live, firstResult) } : {}),
     };
     const finish = toolCalls.length ? 'tool_calls' : 'stop';
     return {
@@ -335,10 +395,17 @@ export function createChatCompletions({ accountStore, accountRouter, clientKeys,
       send() {
         if (signal.aborted || res.destroyed) return;
         if (stream) {
-          stream.content(streamed ? streamed.rest : content ?? '');
-          if (toolCalls.length) stream.toolCalls(toolCalls);
-          stream.finish(finish, final, input.includeUsage);
-        } else json(res, 200, { id: ids.id, object: 'chat.completion', created: ids.created, model: MODEL, ...selection, ...final, choices: [{ index: 0, message: { role: 'assistant', content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }, finish_reason: finish }], usage: null, conversation_id: result.conversationId });
+          const rest = streamed ? streamed.rest : content ?? '';
+          if (rest) { timing.mark('first_text'); stream.content(rest); }
+          if (toolCalls.length) { timing.mark('first_tool_call'); stream.toolCalls(toolCalls); }
+          timing.mark('finish');
+          stream.finish(finish, { ...final, timings: timing.snapshot() }, input.includeUsage);
+        } else {
+          if (content) timing.mark('first_text');
+          if (toolCalls.length) timing.mark('first_tool_call');
+          timing.mark('finish');
+          json(res, 200, { id: ids.id, object: 'chat.completion', created: ids.created, model: MODEL, ...selection, ...final, timings: timing.snapshot(), choices: [{ index: 0, message: { role: 'assistant', content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }, finish_reason: finish }], usage: null, conversation_id: result.conversationId });
+        }
       },
     };
   }
