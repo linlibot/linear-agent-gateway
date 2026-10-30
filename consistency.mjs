@@ -121,6 +121,50 @@ export function sameContent(a, b) {
   return null;
 }
 
+// Linear may parse a bare HTML document as Markdown, changing indentation and
+// rendering autolinked URLs as [url](url). Compare that rendering without ever
+// using its mangled source as the answer. Reject whitespace-sensitive documents
+// and preserve all quoted strings, except SVG path data where indentation between
+// existing lines is insignificant. This is intentionally narrower than generic
+// whitespace-insensitive equality: an actual code or string edit must still fail.
+export function htmlRichEquivalent(raw, rendered) {
+  const unwrap = text => String(text ?? '').replace(/\r\n?/g, '\n').replace(/^\s*```html[ \t]*\n/i, '').replace(/\n```\s*$/, '').trim();
+  const original = unwrap(raw);
+  const final = unwrap(rendered).replace(/\[(https?:\/\/[^\]\s]+)\]\((https?:\/\/[^)\s]+)\)/g, (match, label, target) => label === target ? label : match);
+  if (!/^(?:<!doctype html\b|<html\b)/i.test(original) || !/<\/html>\s*$/i.test(original)) return false;
+  if (!/^(?:<!doctype html\b|<html\b)/i.test(final) || !/<\/html>\s*$/i.test(final)) return false;
+  if (/<(?:pre|textarea|xmp|plaintext)\b|\bwhite-space\s*:\s*(?:pre|break-spaces)/i.test(original + final)) return false;
+  const lines = text => text.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+  if (lines(original) !== lines(final)) return false;
+  const strings = text => {
+    const values = [];
+    let quote = null, start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (quote) {
+        if (ch === '\\') { i++; continue; }
+        if (ch !== quote) continue;
+        let value = text.slice(start, i + 1);
+        const lt = text.lastIndexOf('<', start), gt = text.lastIndexOf('>', start);
+        const tag = text.slice(lt, start), before = text.slice(Math.max(0, start - 120), start);
+        const pathAttribute = lt > gt && /^<path\b/i.test(tag) && /\bd\s*=\s*$/i.test(tag);
+        const pathTemplate = quote === '`' && /\.setAttribute\(\s*["']d["']\s*,\s*$/i.test(before) && !/\$\{[^}]*\n/.test(value);
+        if (pathAttribute || pathTemplate) value = value.split('\n').map(line => line.trim()).join('\n');
+        values.push(value);
+        quote = null;
+      } else if (ch === '"' || ch === "'" || ch === '`') { quote = ch; start = i; }
+    }
+    return quote ? null : values;
+  };
+  const a = strings(original), b = strings(final);
+  if (!a || !b || a.length !== b.length || a.some((value, i) => value !== b[i])) return false;
+  // Preserve visible text and the presence of whitespace between elements:
+  // removing an inter-tag space can change how inline elements are displayed.
+  const visible = text => text.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '').split(/<[^>]*>/);
+  const va = visible(original), vb = visible(final);
+  return va.length === vb.length && va.every((value, i) => value.trim() || vb[i].trim() ? value === vb[i] : Boolean(value) === Boolean(vb[i]));
+}
+
 /**
  * The part of `finalText` that follows an already streamed prefix, or null when
  * the prefix is not consistent with it. A plain string prefix is used directly;

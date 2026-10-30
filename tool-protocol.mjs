@@ -26,7 +26,8 @@ export const newToolCallId = () => 'call_' + [...randomBytes(24)].map(b => ID_AL
 
 export function normalizeTools(tools) {
   if (tools === undefined || tools === null) return [];
-  if (!Array.isArray(tools) || tools.length > MAX_TOOLS) throw invalidTools(`tools must be an array of at most ${MAX_TOOLS} function definitions.`);
+  if (!Array.isArray(tools)) throw invalidTools(`tools must be an array; received ${typeof tools}.`);
+  if (tools.length > MAX_TOOLS) throw invalidTools(`tools contains ${tools.length} definitions; the maximum is ${MAX_TOOLS}.`);
   const names = new Set();
   let size = 0;
   return tools.map((tool, index) => {

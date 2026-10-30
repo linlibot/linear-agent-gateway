@@ -79,6 +79,58 @@ test('polling does not accept an old completed response or retry the send mutati
   assert.equal(reads, 2);
 });
 
+test('transient failures reading an accepted turn are retried without resending or cancelling it', async () => {
+  let sends = 0, reads = 0, cancels = 0;
+  const client = new LinearClient({ headers: {} }, { pollMs: 0, readRetryDelays: [0, 0], fetchImpl: async (url, options) => {
+    const { query } = JSON.parse(options.body);
+    if (query.startsWith('mutation AiConversationSendMessage')) { sends++; return response(accepted); }
+    if (query.startsWith('mutation AiConversationCancel')) { cancels++; return response({ aiConversationCancel: { success: true } }); }
+    reads++;
+    if (reads === 1) throw new TypeError('network failure');
+    if (reads === 2) return new Response('temporarily unavailable', { status: 503 });
+    return response({ aiConversation: { status: 'complete', parts: [part('new-turn', 'Recovered')] } });
+  } });
+  const result = await client.chat({ text: 'hello' }, AbortSignal.timeout(2000));
+  assert.equal(result.text, 'Recovered');
+  assert.equal(sends, 1);
+  assert.equal(reads, 3);
+  assert.equal(cancels, 0);
+});
+
+test('read retries are bounded, while authentication errors are not retried', async () => {
+  for (const auth of [false, true]) {
+    let sends = 0, reads = 0, cancels = 0;
+    const client = new LinearClient({ headers: {} }, { pollMs: 0, readRetryDelays: [0, 0], fetchImpl: async (url, options) => {
+      const { query } = JSON.parse(options.body);
+      if (query.startsWith('mutation AiConversationSendMessage')) { sends++; return response(accepted); }
+      if (query.startsWith('mutation AiConversationCancel')) { cancels++; return response({ aiConversationCancel: { success: true } }); }
+      reads++;
+      return new Response(JSON.stringify({ errors: [{ extensions: { code: auth ? 'UNAUTHENTICATED' : 'UNAVAILABLE' } }] }), { status: auth ? 401 : 503 });
+    } });
+    await assert.rejects(client.chat({ text: 'hello' }, AbortSignal.timeout(2000)), error => error.code === (auth ? 'linear_session_expired' : 'linear_upstream_error'));
+    assert.equal(sends, 1);
+    assert.equal(reads, auth ? 1 : 3);
+    assert.equal(cancels, 1);
+  }
+});
+
+test('cancelling during read backoff stops retries and cancels the accepted turn', async () => {
+  const controller = new AbortController();
+  let sends = 0, reads = 0, cancels = 0;
+  const client = new LinearClient({ headers: {} }, { readRetryDelays: [1000, 1000], fetchImpl: async (url, options) => {
+    const { query } = JSON.parse(options.body);
+    if (query.startsWith('mutation AiConversationSendMessage')) { sends++; return response(accepted); }
+    if (query.startsWith('mutation AiConversationCancel')) { cancels++; return response({ aiConversationCancel: { success: true } }); }
+    reads++;
+    setTimeout(() => controller.abort(new Error('cancelled by caller')), 10);
+    throw new TypeError('network failure');
+  } });
+  await assert.rejects(client.chat({ text: 'hello' }, controller.signal), /cancelled by caller/);
+  assert.equal(sends, 1);
+  assert.equal(reads, 1);
+  assert.equal(cancels, 1);
+});
+
 test('reasoning choices validate without rewriting the user prompt', () => {
   for (const effort of ['low', 'medium', 'high']) {
     const input = validateRequest({ ...valid, reasoning_effort: effort });

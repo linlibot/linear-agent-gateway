@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { GatewayError } from './errors.mjs';
 import { textDoc } from './rich-doc.mjs';
 import { normalizeMessages } from './messages.mjs';
@@ -42,6 +43,7 @@ const CANCEL_QUERY = `mutation AiConversationCancel($id: String!) {
   aiConversationCancel(id: $id) { success aiConversation { id } }
 }`;
 const EMPTY_COMPLETE_POLLS = 3;
+const READ_RETRY_DELAYS_MS = [250, 750];
 let detailedReadSupported = true;
 export const detailedReadState = { get supported() { return detailedReadSupported; }, reset() { detailedReadSupported = true; } };
 
@@ -250,11 +252,12 @@ function waiter(signal) {
 
 export class LinearClient {
   /** `realtime` is an optional channel factory (see realtime.mjs); without it the client only polls. */
-  constructor(session, { fetchImpl = fetch, pollMs = 1500, realtime = null } = {}) {
+  constructor(session, { fetchImpl = fetch, pollMs = 1500, realtime = null, readRetryDelays = READ_RETRY_DELAYS_MS } = {}) {
     this.session = session;
     this.fetch = fetchImpl;
     this.pollMs = pollMs;
     this.realtime = realtime;
+    this.readRetryDelays = readRetryDelays;
   }
   async call(query, variables, signal) {
     let response;
@@ -262,20 +265,20 @@ export class LinearClient {
       response = await this.fetch(ENDPOINT, { method: 'POST', headers: this.session.headers, body: JSON.stringify({ query, variables }), signal: AbortSignal.any([signal ?? new AbortController().signal, AbortSignal.timeout(30000)]) });
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
-      throw new GatewayError(502, 'linear_network_error', 'The request to Linear failed or timed out.');
+      throw Object.assign(new GatewayError(502, 'linear_network_error', 'The request to Linear failed or timed out.'), { retryableRead: true });
     }
     let result;
     try { result = await response.json(); }
-    catch { throw new GatewayError(502, 'linear_invalid_response', 'Linear returned a non-JSON response.'); }
+    catch { throw Object.assign(new GatewayError(502, 'linear_invalid_response', 'Linear returned a non-JSON response.'), { retryableRead: response.status === 408 || response.status === 429 || response.status >= 500 }); }
     if (!response.ok || result.errors?.length) {
       if (result.data?.aiConversationSendMessage) throw new GatewayError(502, 'linear_send_uncertain', 'Linear returned an ambiguous send result. The request will not be replayed.');
       const auth = [401, 403].includes(response.status) || result.errors?.some(e => /AUTHENTICATION|UNAUTHENTICATED/.test(e.extensions?.code ?? ''));
       if (auth) throw new GatewayError(503, 'linear_session_expired', 'Linear authentication failed. Refresh the local login session.');
-      if (response.status === 429) throw new GatewayError(429, 'linear_rate_limit', 'Linear rate limit reached. Please wait before trying again.');
+      if (response.status === 429) throw Object.assign(new GatewayError(429, 'linear_rate_limit', 'Linear rate limit reached. Please wait before trying again.'), { retryableRead: true });
       if (result.errors?.some(e => e.extensions?.code === 'GRAPHQL_VALIDATION_FAILED' || /^(Cannot query field|Unknown type|Unknown fragment|Fragment cannot be spread)/.test(e.message ?? ''))) throw new GatewayError(502, 'linear_query_unsupported', 'Linear does not accept this query shape.');
       // Input validation errors mean the operation did not run; callers may adjust and resend.
       const invalidInput = Boolean(result.errors?.length && result.errors.every(e => e.extensions?.code === 'BAD_USER_INPUT' && !e.path && /^Variable "\$input" got invalid value/.test(e.message ?? '')));
-      throw Object.assign(new GatewayError(502, 'linear_upstream_error', 'Linear rejected the chat request.'), { invalidInput });
+      throw Object.assign(new GatewayError(502, 'linear_upstream_error', 'Linear rejected the chat request.'), { invalidInput, retryableRead: response.status === 408 || response.status === 429 || response.status >= 500 });
     }
     if (!result.data) throw new GatewayError(502, 'linear_invalid_response', 'Linear returned no data.');
     return result.data;
@@ -286,6 +289,18 @@ export class LinearClient {
       catch (error) { if (error.code !== 'linear_query_unsupported') throw error; detailedReadSupported = false; }
     }
     return (await this.call(READ_QUERY, { id }, signal)).aiConversation;
+  }
+  /** Retry only the read of an accepted turn; never replay a send or a tool action. */
+  async readAcceptedTurn(id, signal) {
+    for (let attempt = 0;; attempt++) {
+      try { return await this.read(id, signal); }
+      catch (error) {
+        if (signal?.aborted) throw signal.reason;
+        if (!error.retryableRead || attempt >= this.readRetryDelays.length) throw error;
+        try { await sleep(this.readRetryDelays[attempt], undefined, { signal }); }
+        catch (waitError) { if (signal?.aborted) throw signal.reason; throw waitError; }
+      }
+    }
   }
   async cancel(id) {
     await this.call(CANCEL_QUERY, { id }, AbortSignal.timeout(5000)).catch(() => {});
@@ -328,7 +343,7 @@ export class LinearClient {
     await onAccepted(id);
     for (;;) {
       signal?.throwIfAborted();
-      const conversation = await this.read(id, signal);
+      const conversation = await this.readAcceptedTurn(id, signal);
       if (!conversation) throw new GatewayError(502, 'linear_conversation_missing', 'Linear did not return the conversation.');
       const parts = currentTurnParts(conversation, assistantId);
       channel?.identify(parts);

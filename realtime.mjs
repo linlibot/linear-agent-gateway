@@ -16,6 +16,7 @@
 
 import { richText } from './upstream.mjs';
 import { skeleton } from './consistency.mjs';
+import { createHash } from 'node:crypto';
 
 export const REALTIME_URL = 'wss://sync.linear.app/';
 export const REALTIME_MODES = ['ws', 'off'];
@@ -189,9 +190,11 @@ export class TurnStream {
   applyMessage(message) {
     const items = Array.isArray(message.data) ? message.data : [message.data];
     // Exact resends and cursors that go backwards are dropped as duplicates.
+    // A cursor and delta length alone are not an identity: distinct fragments of
+    // equal length can share a cursor. Retain only a hash, never message content.
     const cursor = cursorKey(message.cursor);
     if (cursor) {
-      const fingerprint = cursor.key + '|' + items.map(item => [item?.type, item?.id, typeof item?.delta === 'string' ? item.delta.length : ''].join(':')).join(',');
+      const fingerprint = cursor.key + '|' + createHash('sha256').update(JSON.stringify(items)).digest('base64url');
       if (this.seen.has(fingerprint) || (cursor.order && this.lastCursor && earlier(cursor.order, this.lastCursor))) { this.stats.duplicates++; return { changed: false, hint: false }; }
       if (this.seen.size < MAX_SEEN) this.seen.add(fingerprint);
       if (cursor.order) this.lastCursor = cursor.order;

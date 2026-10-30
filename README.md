@@ -339,6 +339,8 @@ JSON 响应中，`message.content` 为模型写在代码块之前的说明文字
 - **只发送真实正文**：role 事件和心跳不计为首字；不插入占位文字，也不拆分最终答案。暂缓发送尾部空白和被拆开的代理对字符；part 开头在能判断是否为 HTML 文档之前暂缓，完整 HTML 文档放入 `html` 代码围栏逐步发送（与轮询路径的最终渲染一致）；Markdown 和代码围栏按模型原文发送。
 - **工具模式**：只发送协议代码块之前的完整文字行；遇到代码围栏、`tool_calls`、nonce、以 `{` / `[` 开头的行等协议迹象即停止，工具 JSON 不会提前出现。工具调用仍等整个回合解析，并通过 nonce、工具名、JSON 与 Schema 校验后才发送；修正回合不实时转发。
 - **最终一致性**：GraphQL 仍是完成、错误和最终文本的依据。最终校验只允许列表标记、编号、围栏语言名和配对强调等展示差异；代码运算符、缩进、标点、小数、URL、标识符与 emoji 必须一致。字母数字骨架仅用于识别流起点，不能证明最终相等。真实事件省略开头代码围栏时，只在文档替换步骤明确证明创建起始代码块、且语言行匹配时恢复围栏。无法安全衔接时返回 `linear_stream_rewritten`，不拼接不同版本。
+- **裸 HTML 富文本转换**：Linear 有时把未经围栏包裹的 HTML 按 Markdown 解析，改变行首缩进或自动链接 URL。仅当完整 HTML 的逐行内容、可见文字、字符串和 SVG 路径等经过保守比对时，保留实时原文并标记 `consistency: "html_rich"`；其他差异仍按原有安全策略处理。带 `<pre>`、`<textarea>` 或空白敏感样式的文档不走这项宽松匹配。
+- 实时事件去重同时检查游标和消息内容的哈希，避免同游标、同长度的不同片段被错误丢弃。已接收的回合在读取 Linear 时遇到短暂网络故障或服务器错误，会在同一回合内有限重试；不会重发消息或工具调用。
 - **轮询兜底**：没有 `useraccount` / `linear-client-version` 凭证头、握手超时、`noauth`、异常或超大消息、连接中断时，该请求继续读取同一个 Linear 回合（已接受的消息绝不重发），并在最后补发剩余文本。正文正在实时到达时 GraphQL 轮询放慢到 `LINEAR_REALTIME_POLL_MS`；正文停顿约 0.6 秒、收到完成快照或连接失效时立即恢复正常轮询，避免无用连接拖慢完成检测。
 - 结束 chunk 的 `streaming` 包含 `source`（`realtime` / `polling` / `final`）、`progressive_chunks`、`consistency`、`realtime_stopped` 及 `realtime` 计数（状态、`fallback_reason`、增量数、重复、过滤等，不含正文）；顶层 `timings` 给出相对上游发送的毫秒数：`send_ack_ms`、`realtime_ready_ms`、`first_stream_event_ms`、`first_answer_delta_ms`、`first_text_ms`、`first_tool_call_ms`、`upstream_complete_ms`、`finish_ms`。JSON 响应也带 `timings`。
 - 请求头 `x-linear-realtime: off` 可让单个请求改用轮询，便于同一部署上做前后对比；它不能在服务端关闭实时通道时强制开启。

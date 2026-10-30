@@ -15,7 +15,7 @@
 
 import { answerParts, answerText, renderAnswerPart, startsLikeHtmlDocument } from './upstream.mjs';
 import { GatewayError } from './errors.mjs';
-import { sameContent, spliceRest } from './consistency.mjs';
+import { htmlRichEquivalent, sameContent, spliceRest } from './consistency.mjs';
 
 const rewritten = () => new GatewayError(502, 'linear_stream_rewritten', 'Linear rewrote already streamed text. Discard this partial reply and use buffered streaming.');
 
@@ -166,6 +166,7 @@ export function verifyPart(part, final) {
   if (!raw) return null;
   const body = typeof final.body === 'string' ? final.body.replace(/\r\n?/g, '\n').trim() : null;
   if (body !== null && body === raw) return 'exact';
+  if (htmlRichEquivalent(raw, renderAnswerPart(final))) return 'html_rich';
   // The syntax heuristic is for Markdown; an HTML document is compared by content only.
   if (htmlStart(raw) !== 'html' && plainDeltas(final.bodyData, raw)) return null;
   const form = liveForm(part, { final: true }).text;

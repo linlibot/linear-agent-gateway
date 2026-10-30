@@ -45,6 +45,11 @@ test('tool definitions are validated strictly and keep their schemas', () => {
   assert.equal(normalizeTools([fn('s', { type: 'object' }, { strict: true })])[0].strict, true);
 });
 
+test('tool validation reports the request shape or count without including tool contents', () => {
+  assert.throws(() => normalizeTools({ secret: 'do not reveal' }), e => e.code === 'invalid_tools' && /received object/.test(e.message) && !e.message.includes('secret'));
+  assert.throws(() => normalizeTools(Array.from({ length: 257 }, () => ({ secret: 'do not reveal' }))), e => e.code === 'invalid_tools' && /257/.test(e.message) && /256/.test(e.message) && !e.message.includes('secret'));
+});
+
 test('tool_choice supports auto, none, required, a named function and allowed_tools', () => {
   assert.equal(normalizeToolChoice(undefined, tools).mode, 'auto');
   assert.equal(normalizeToolChoice(undefined, []).mode, 'none');

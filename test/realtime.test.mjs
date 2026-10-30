@@ -5,7 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createGateway } from '../gateway.mjs';
 import { detailedReadState } from '../upstream.mjs';
 import { promptFormatState } from '../chat-completions.mjs';
-import { contentSkeleton, skeleton, sameContent, spliceRest } from '../consistency.mjs';
+import { contentSkeleton, htmlRichEquivalent, skeleton, sameContent, spliceRest } from '../consistency.mjs';
 import { LiveText, holdTrailing, htmlStart, liveForm, verifyPart } from '../progressive.mjs';
 import { RealtimeChannel, TurnStream, createTiming, isLinearRealtimeUrl, realtimeIdentity } from '../realtime.mjs';
 import { readConfig } from '../config.mjs';
@@ -179,6 +179,28 @@ test('duplicate and out-of-order messages (same cursor) are applied once', async
   assert.equal(finished(result).streaming.consistency, 'exact');
 });
 
+test('equal-length deltas sharing a cursor are streamed intact and exact duplicates are ignored', async t => {
+  const text = 'abcdef';
+  const { complete } = await setup(t, () => ({
+    markdown: text, hold: true,
+    realtime: ({ turn }) => {
+      const id = turn.id + ':0', meta = { phase: 'answer', turnId: turn.id };
+      const delta = value => ({ cmd: 'streamData', cursor: 2, data: { type: 'textDelta', id, delta: value } });
+      return [
+        { message: { cmd: 'streamData', cursor: 1, data: { type: 'text', id, bodyData: { type: 'doc', content: [] }, status: 'inProgress', metadata: meta } } },
+        { message: delta('abc') }, { delay: 30 }, { message: delta('def') },
+        { message: delta('def') }, { delay: 30 },
+        { message: { cmd: 'streamData', cursor: 3, data: { type: 'text', id, bodyData: markdownToDoc(text), status: 'complete', metadata: meta } } },
+        { release: true },
+      ];
+    },
+  }));
+  const result = await complete(ask());
+  assert.equal(result.message.content, text);
+  assert.equal(finished(result).streaming.consistency, 'exact');
+  assert.equal(finished(result).streaming.realtime.duplicates, 1);
+});
+
 test('a conversation subscription ignores other conversations, old turns, commentary and reasoning', async t => {
   const text = 'Only this answer belongs to the current turn.';
   const { complete, sync, upstream } = await setup(t, ANSWER(text, {
@@ -226,6 +248,27 @@ test('an HTML document streams inside an html fence and matches the polled rende
   assert(chunks.length >= 3);
   const polled = await (await setup(t, () => ({ markdown: html }), { realtime: null })).complete(ask());
   assert.equal(polled.message.content, result.message.content, 'same final text as the polling path');
+});
+
+test('a bare HTML stream survives Linear rich-text indentation and URL conversion', async t => {
+  const raw = '<!DOCTYPE html>\n<html><body>\n<svg><path d="M1 2\n    L3 4" /></svg>\n<script>\n  const url = "https://example.org/svg";\n  node.setAttribute("d", `M1 2\n      L3 4`);\n</script>\n</body></html>';
+  const rendered = raw.replace('    L3 4', '  L3 4').replace('      L3 4', '  L3 4').replace('  const url', 'const url').replace('  node.setAttribute', 'node.setAttribute').replace('https://example.org/svg', '[https://example.org/svg](https://example.org/svg)');
+  assert.equal(htmlRichEquivalent(raw, rendered), true);
+  const bodyData = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: rendered }] }] };
+  const { complete } = await setup(t, () => ({ markdown: raw, body: rendered, bodyData, hold: true, realtime: ({ helpers }) => helpers.autoSteps({ text: raw, deltas: 25 }) }));
+  const result = await complete(ask());
+  assert.equal(result.message.content, '```html\n' + raw + '\n```');
+  assert.equal(finished(result).streaming.consistency, 'html_rich');
+});
+
+test('HTML rich-text matching rejects code edits, whitespace-sensitive text and non-path templates', () => {
+  const raw = '<!DOCTYPE html>\n<html><body>\n<span>Hello </span>\n<script>\n  const text = `line 1\n  line 2`;\n  const n = 1 + 2;\n</script>\n</body></html>';
+  assert.equal(htmlRichEquivalent(raw, raw.replace('1 + 2', '1 - 2')), false);
+  assert.equal(htmlRichEquivalent(raw, raw.replace('  line 2', ' line 2')), false);
+  assert.equal(htmlRichEquivalent(raw, raw.replace('Hello ', 'Hello')), false);
+  const inline = '<!DOCTYPE html>\n<html><body><span>A</span> <span>B</span></body></html>';
+  assert.equal(htmlRichEquivalent(inline, inline.replace('</span> <span>', '</span><span>')), false);
+  assert.equal(htmlRichEquivalent(raw.replace('<span>', '<pre>').replace('</span>', '</pre>'), raw.replace('<span>', '<pre>').replace('</span>', '</pre>')), false);
 });
 
 test('raw Markdown that Linear normalizes (bullets, fence info) is verified by content and kept as streamed', async t => {
@@ -477,6 +520,18 @@ test('turn streams drop duplicates and foreign parts, and close earlier parts wh
   assert.equal(turn.diverged, 'late_delta');
   assert.equal(live.fromRealtime(turn), '');
   assert.equal(live.frozen, 'late_delta');
+});
+
+test('same cursor and length do not make different realtime deltas duplicates', () => {
+  const turn = turnWith('turn-1', 'conversation');
+  turn.applyMessage(textMessage('a', { type: 'doc', content: [] }));
+  const first = { ...deltaMessage('a', 'abc'), cursor: 5 };
+  const second = { ...deltaMessage('a', 'def'), cursor: 5 };
+  turn.applyMessage(first);
+  turn.applyMessage(second);
+  turn.applyMessage(second);
+  assert.equal(turn.parts.get('a').raw, 'abcdef');
+  assert.equal(turn.stats.duplicates, 1);
 });
 
 test('verification accepts the body, the rich rendering or mention-only differences, and rejects plain-text deltas', () => {
